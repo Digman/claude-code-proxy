@@ -1,10 +1,10 @@
 mod layout;
 
 use layout::{
-    CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, EGRESS_WIDTH,
-    ENDPOINT_WIDTH, ERROR_WIDTH, ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH,
-    MODEL_WIDE_WIDTH, PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH,
-    STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
+    CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, EGRESS_MAX_WIDTH,
+    EGRESS_MIN_WIDTH, ENDPOINT_WIDE_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH, ID_WIDTH, LayoutTier,
+    MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH, PROJECT_MEDIUM_WIDTH,
+    PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
 };
 
 use std::{
@@ -55,7 +55,6 @@ const PURPLE: Color = Color::Rgb(190, 140, 240);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
-const ACTIVE_EGRESS_MIN_WIDTH: u16 = 188;
 
 pub struct MonitorUiConfig<'a> {
     pub listen_url: String,
@@ -1217,12 +1216,17 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
         LayoutTier::Wide => vec![
             ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
+            ColumnSpec::flex(C::Project, "Project", Alignment::Left, 1),
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
-            ColumnSpec::flex(C::Endpoint, "Endpoint", Alignment::Left, 1),
+            ColumnSpec::fixed(
+                C::Endpoint,
+                "Endpoint",
+                Alignment::Left,
+                ENDPOINT_WIDE_WIDTH,
+            ),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
@@ -1268,9 +1272,43 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
     }
 }
 
-fn active_columns_for_width(width: u16) -> Vec<ColumnSpec<ActiveColumn>> {
-    let mut columns = active_columns(LayoutTier::for_outer_width(width));
-    if width >= ACTIVE_EGRESS_MIN_WIDTH {
+fn fixed_column_budget<K>(columns: &[ColumnSpec<K>]) -> u16 {
+    let widths = columns
+        .iter()
+        .map(|column| match column.width {
+            layout::ColumnWidth::Fixed(width) => width,
+            layout::ColumnWidth::Flex(_) => 0,
+        })
+        .sum::<u16>();
+    widths.saturating_add(columns.len().saturating_sub(1) as u16)
+}
+
+fn active_egress_width(
+    active: &[ActiveRequest],
+    provider_egress: &HashMap<String, EgressState>,
+) -> u16 {
+    active
+        .iter()
+        .filter_map(|request| request.provider.as_deref())
+        .filter_map(|provider| provider_egress.get(provider))
+        .filter_map(|state| match state {
+            EgressState::Available(address) => Some(address.len() as u16),
+            EgressState::Resolving | EgressState::Unavailable => None,
+        })
+        .max()
+        .unwrap_or(EGRESS_MIN_WIDTH)
+        .clamp(EGRESS_MIN_WIDTH, EGRESS_MAX_WIDTH)
+}
+
+fn active_columns_for_width(width: u16, egress_width: u16) -> Vec<ColumnSpec<ActiveColumn>> {
+    let tier = LayoutTier::for_outer_width(width);
+    let mut columns = active_columns(tier);
+    let egress_width = egress_width.clamp(EGRESS_MIN_WIDTH, EGRESS_MAX_WIDTH);
+    let required_inner_width = fixed_column_budget(&columns)
+        .saturating_add(1)
+        .saturating_add(egress_width)
+        .saturating_add(PROJECT_WIDE_WIDTH);
+    if tier == LayoutTier::Wide && width.saturating_sub(2) >= required_inner_width {
         let index = columns
             .iter()
             .position(|column| column.key == ActiveColumn::Endpoint)
@@ -1281,7 +1319,7 @@ fn active_columns_for_width(width: u16) -> Vec<ColumnSpec<ActiveColumn>> {
                 ActiveColumn::Egress,
                 "Egress",
                 Alignment::Left,
-                EGRESS_WIDTH,
+                egress_width,
             ),
         );
     }
@@ -1300,7 +1338,8 @@ fn render_active(
         return;
     }
 
-    let columns = active_columns_for_width(area.width);
+    let egress_width = active_egress_width(active, provider_egress);
+    let columns = active_columns_for_width(area.width, egress_width);
     let widths = column_constraints(&columns);
     let rows = active.iter().map(|request| {
         let status = if request.status == crate::monitor::RequestStatus::Compacting {
@@ -2084,17 +2123,6 @@ mod tests {
         columns.iter().map(|column| column.header).collect()
     }
 
-    fn fixed_budget<K>(columns: &[ColumnSpec<K>]) -> u16 {
-        let widths = columns
-            .iter()
-            .map(|column| match column.width {
-                layout::ColumnWidth::Fixed(width) => width,
-                layout::ColumnWidth::Flex(_) => 0,
-            })
-            .sum::<u16>();
-        widths.saturating_add(columns.len().saturating_sub(1) as u16)
-    }
-
     fn fixed_width<K: Copy + PartialEq>(columns: &[ColumnSpec<K>], key: K) -> Option<u16> {
         columns
             .iter()
@@ -2178,29 +2206,29 @@ mod tests {
 
     #[test]
     fn responsive_schemas_fit_their_minimum_terminal_widths() {
-        assert!(fixed_budget(&session_columns(LayoutTier::Emergency, false)) <= 75);
-        assert!(fixed_budget(&session_columns(LayoutTier::Narrow, false)) <= 76);
-        assert!(fixed_budget(&session_columns(LayoutTier::Medium, false)) <= 88);
-        assert!(fixed_budget(&session_columns(LayoutTier::Expanded, false)) <= 118);
-        assert!(fixed_budget(&session_columns(LayoutTier::Wide, true)) <= 168);
+        assert!(fixed_column_budget(&session_columns(LayoutTier::Emergency, false)) <= 75);
+        assert!(fixed_column_budget(&session_columns(LayoutTier::Narrow, false)) <= 76);
+        assert!(fixed_column_budget(&session_columns(LayoutTier::Medium, false)) <= 88);
+        assert!(fixed_column_budget(&session_columns(LayoutTier::Expanded, false)) <= 118);
+        assert!(fixed_column_budget(&session_columns(LayoutTier::Wide, true)) <= 168);
 
-        assert!(fixed_budget(&active_columns(LayoutTier::Emergency)) <= 75);
-        assert!(fixed_budget(&active_columns(LayoutTier::Narrow)) <= 76);
-        assert!(fixed_budget(&active_columns(LayoutTier::Medium)) <= 88);
-        assert!(fixed_budget(&active_columns(LayoutTier::Expanded)) <= 118);
-        assert!(fixed_budget(&active_columns(LayoutTier::Wide)) <= 152);
+        assert!(fixed_column_budget(&active_columns(LayoutTier::Emergency)) <= 75);
+        assert!(fixed_column_budget(&active_columns(LayoutTier::Narrow)) <= 76);
+        assert!(fixed_column_budget(&active_columns(LayoutTier::Medium)) <= 88);
+        assert!(fixed_column_budget(&active_columns(LayoutTier::Expanded)) <= 118);
+        assert!(fixed_column_budget(&active_columns(LayoutTier::Wide)) <= 152);
 
-        assert!(fixed_budget(&recent_columns(LayoutTier::Emergency)) <= 75);
-        assert!(fixed_budget(&recent_columns(LayoutTier::Narrow)) <= 76);
-        assert!(fixed_budget(&recent_columns(LayoutTier::Medium)) <= 88);
-        assert!(fixed_budget(&recent_columns(LayoutTier::Expanded)) <= 118);
-        assert!(fixed_budget(&recent_columns(LayoutTier::Wide)) <= 152);
+        assert!(fixed_column_budget(&recent_columns(LayoutTier::Emergency)) <= 75);
+        assert!(fixed_column_budget(&recent_columns(LayoutTier::Narrow)) <= 76);
+        assert!(fixed_column_budget(&recent_columns(LayoutTier::Medium)) <= 88);
+        assert!(fixed_column_budget(&recent_columns(LayoutTier::Expanded)) <= 118);
+        assert!(fixed_column_budget(&recent_columns(LayoutTier::Wide)) <= 152);
 
-        assert!(fixed_budget(&event_columns(LayoutTier::Emergency)) <= 75);
-        assert!(fixed_budget(&event_columns(LayoutTier::Narrow)) <= 76);
-        assert!(fixed_budget(&event_columns(LayoutTier::Medium)) <= 88);
-        assert!(fixed_budget(&event_columns(LayoutTier::Expanded)) <= 118);
-        assert!(fixed_budget(&event_columns(LayoutTier::Wide)) <= 152);
+        assert!(fixed_column_budget(&event_columns(LayoutTier::Emergency)) <= 75);
+        assert!(fixed_column_budget(&event_columns(LayoutTier::Narrow)) <= 76);
+        assert!(fixed_column_budget(&event_columns(LayoutTier::Medium)) <= 88);
+        assert!(fixed_column_budget(&event_columns(LayoutTier::Expanded)) <= 118);
+        assert!(fixed_column_budget(&event_columns(LayoutTier::Wide)) <= 152);
     }
 
     #[test]
@@ -2250,10 +2278,88 @@ mod tests {
         assert!(!wide.contains("Egress"), "{wide}");
         assert!(wide.contains("In"), "{wide}");
         assert!(wide.contains("Out"), "{wide}");
+    }
 
-        let with_egress = render_at(ACTIVE_EGRESS_MIN_WIDTH);
-        assert!(with_egress.contains("Egress"), "{with_egress}");
-        assert!(with_egress.contains("178.249.214.12"), "{with_egress}");
+    #[test]
+    fn wide_active_schema_gives_project_flexible_space_and_fixes_endpoint_width() {
+        let columns = active_columns(LayoutTier::Wide);
+        let project = columns
+            .iter()
+            .find(|column| column.key == ActiveColumn::Project)
+            .unwrap();
+
+        assert_eq!(project.width, layout::ColumnWidth::Flex(1));
+        assert_eq!(
+            fixed_width(&columns, ActiveColumn::Endpoint),
+            Some(ENDPOINT_WIDE_WIDTH)
+        );
+    }
+
+    #[test]
+    fn active_egress_width_tracks_the_longest_visible_address() {
+        let mut state = mock_state();
+        assert_eq!(
+            active_egress_width(&state.active, &state.provider_egress),
+            EGRESS_MIN_WIDTH
+        );
+
+        let address = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+        state.provider_egress.insert(
+            "codex".to_string(),
+            EgressState::Available(address.to_string()),
+        );
+
+        assert_eq!(
+            active_egress_width(&state.active, &state.provider_egress),
+            EGRESS_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn wide_active_table_shows_compact_ipv4_without_squeezing_project() {
+        let state = mock_state();
+        let egress_width = active_egress_width(&state.active, &state.provider_egress);
+        let minimum_outer_width = fixed_column_budget(&active_columns(LayoutTier::Wide))
+            + 1
+            + egress_width
+            + PROJECT_WIDE_WIDTH
+            + 2;
+
+        let hidden = buffer_text(&draw(minimum_outer_width - 1, 8, |frame| {
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
+        }));
+        assert!(!hidden.contains("Egress"), "{hidden}");
+
+        let columns = active_columns_for_width(220, egress_width);
+        let widths = column_constraints(&columns);
+        let project_index = columns
+            .iter()
+            .position(|column| column.key == ActiveColumn::Project)
+            .unwrap();
+        assert_eq!(
+            fixed_width(&columns, ActiveColumn::Egress),
+            Some(EGRESS_MIN_WIDTH)
+        );
+        assert!(table_column_width(Rect::new(0, 0, 220, 1), &widths, project_index) >= 16);
+
+        let visible = buffer_text(&draw(220, 8, |frame| {
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
+        }));
+        assert!(visible.contains("Egress"), "{visible}");
+        assert!(visible.contains("178.249.214.12"), "{visible}");
+        assert!(visible.contains("claude-code-proxy"), "{visible}");
     }
 
     #[test]
@@ -2264,8 +2370,14 @@ mod tests {
             "codex".to_string(),
             EgressState::Available(address.to_string()),
         );
+        let egress_width = active_egress_width(&state.active, &state.provider_egress);
+        let minimum_outer_width = fixed_column_budget(&active_columns(LayoutTier::Wide))
+            + 1
+            + egress_width
+            + PROJECT_WIDE_WIDTH
+            + 2;
 
-        let buffer = draw(ACTIVE_EGRESS_MIN_WIDTH, 8, |frame| {
+        let buffer = draw(minimum_outer_width, 8, |frame| {
             render_active(
                 frame,
                 frame.area(),
