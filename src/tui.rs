@@ -32,8 +32,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState, ProviderCredits,
+        ProviderQuota, ProviderQuotaWindow, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
     registry::Registry,
@@ -367,42 +367,61 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
+    let codex_quota = state.provider_quotas.get("codex");
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Length(1),
-        ])
+        .constraints(if codex_quota.is_some() {
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Percentage(30),
+                Constraint::Percentage(20),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![
+                Constraint::Length(1),
+                Constraint::Percentage(30),
+                Constraint::Percentage(20),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Length(1),
+            ]
+        })
         .split(area);
 
+    let content_offset = usize::from(codex_quota.is_some());
     render_header(frame, root[0], app, state);
+    if let Some(quota) = codex_quota {
+        render_subscription_usage(frame, root[1], quota);
+    }
     match app.detail {
-        Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
+        Some(DetailView::Session) => {
+            render_session_detail(frame, root[1 + content_offset], state, app.selected)
+        }
         Some(DetailView::Request) => {
-            render_request_detail(frame, root[1], state, app.recent_selected)
+            render_request_detail(frame, root[1 + content_offset], state, app.recent_selected)
         }
         None => render_sessions(
             frame,
-            root[1],
+            root[1 + content_offset],
             &state.sessions,
             app.selected,
             app.focus == FocusPane::Sessions,
         ),
     }
-    render_active(frame, root[2], &state.active, app.tick);
+    render_active(frame, root[2 + content_offset], &state.active, app.tick);
     render_recent(
         frame,
-        root[3],
+        root[3 + content_offset],
         &state.recent,
         app.recent_selected,
         app.focus == FocusPane::Recent,
     );
-    render_events(frame, root[4], &state.recent);
-    render_footer(frame, root[5], app);
+    render_events(frame, root[4 + content_offset], &state.recent);
+    render_footer(frame, root[5 + content_offset], app);
 
     if app.show_setup {
         render_setup_overlay(frame, area, &app.setup_text);
@@ -463,6 +482,224 @@ fn render_header(
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(TEAL)), area);
+}
+
+fn render_subscription_usage(frame: &mut ratatui::Frame<'_>, area: Rect, quota: &ProviderQuota) {
+    let block = panel("Subscription usage", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let line = quota_line(
+        quota,
+        LayoutTier::for_outer_width(area.width),
+        SystemTime::now(),
+    );
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(PANEL_BG)),
+        inner,
+    );
+}
+
+fn quota_window(quota: &ProviderQuota, minutes: u64) -> Option<&ProviderQuotaWindow> {
+    quota
+        .windows
+        .iter()
+        .find(|window| window.window_minutes == minutes)
+}
+
+fn quota_line(quota: &ProviderQuota, tier: LayoutTier, now: SystemTime) -> Line<'static> {
+    let five_hour = quota_window(quota, 300);
+    let week = quota_window(quota, 10_080);
+    let mut spans = vec![Span::styled(" Codex  ", Style::default().fg(DIM_WHITE))];
+
+    match tier {
+        LayoutTier::Wide | LayoutTier::Expanded => {
+            let wide = tier == LayoutTier::Wide;
+            push_quota_meter(
+                &mut spans,
+                "5h",
+                five_hour,
+                if wide { 18 } else { 8 },
+                wide,
+                now,
+            );
+            spans.push(quota_separator());
+            push_quota_meter(
+                &mut spans,
+                "Week",
+                week,
+                if wide { 18 } else { 8 },
+                wide,
+                now,
+            );
+            push_quota_status(&mut spans, quota, now, wide);
+        }
+        LayoutTier::Medium | LayoutTier::Narrow => {
+            let verbose = tier == LayoutTier::Medium;
+            push_quota_text(&mut spans, "5h", five_hour, verbose, now);
+            spans.push(quota_separator());
+            push_quota_text(&mut spans, "Week", week, verbose, now);
+        }
+        LayoutTier::Emergency => {
+            let (label, window) = if week.is_some() {
+                ("Week", week)
+            } else {
+                ("5h", five_hour)
+            };
+            push_quota_text(&mut spans, label, window, true, now);
+        }
+    }
+    Line::from(spans)
+}
+
+fn push_quota_meter(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    window: Option<&ProviderQuotaWindow>,
+    width: usize,
+    verbose: bool,
+    now: SystemTime,
+) {
+    spans.push(Span::styled(
+        format!("{label:<5}"),
+        Style::default().fg(DIM_WHITE).add_modifier(Modifier::BOLD),
+    ));
+    let Some(window) = window else {
+        spans.push(Span::styled("unavailable", Style::default().fg(DIM)));
+        return;
+    };
+    let remaining = quota_remaining_percent(window);
+    let filled = ((remaining / 100.0) * width as f64).round() as usize;
+    let color = quota_remaining_color(remaining);
+    spans.push(Span::styled(
+        "█".repeat(filled.min(width)),
+        Style::default().fg(color),
+    ));
+    spans.push(Span::styled(
+        "░".repeat(width.saturating_sub(filled)),
+        Style::default().fg(SEPARATOR),
+    ));
+    spans.push(Span::styled(
+        format!("  {:.0}%{}", remaining, if verbose { " left" } else { "" }),
+        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+    ));
+    if let Some(reset) = quota_reset_label(window, now) {
+        spans.push(Span::styled(
+            if verbose {
+                format!("  reset {reset}")
+            } else {
+                format!(" · {reset}")
+            },
+            Style::default().fg(DIM_WHITE),
+        ));
+    }
+}
+
+fn push_quota_text(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    window: Option<&ProviderQuotaWindow>,
+    verbose: bool,
+    now: SystemTime,
+) {
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(DIM_WHITE).add_modifier(Modifier::BOLD),
+    ));
+    let Some(window) = window else {
+        spans.push(Span::styled("-", Style::default().fg(DIM)));
+        return;
+    };
+    let remaining = quota_remaining_percent(window);
+    spans.push(Span::styled(
+        format!("{remaining:.0}%{}", if verbose { " left" } else { "" }),
+        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+    ));
+    if let Some(reset) = quota_reset_label(window, now) {
+        spans.push(Span::styled(
+            if verbose {
+                format!(" · reset {reset}")
+            } else {
+                format!(" · {reset}")
+            },
+            Style::default().fg(DIM_WHITE),
+        ));
+    }
+}
+
+fn push_quota_status(
+    spans: &mut Vec<Span<'static>>,
+    quota: &ProviderQuota,
+    now: SystemTime,
+    verbose: bool,
+) {
+    if let Some((label, color)) = credits_label(quota.credits) {
+        spans.push(quota_separator());
+        spans.push(Span::styled("● ", Style::default().fg(color)));
+        spans.push(Span::styled(label, Style::default().fg(DIM_WHITE)));
+    }
+    let age = now
+        .duration_since(quota.updated_at)
+        .unwrap_or(Duration::ZERO);
+    spans.push(Span::styled(
+        if verbose {
+            format!("  updated {} ago", format_duration(age))
+        } else {
+            format!(" · {} ago", format_duration(age))
+        },
+        Style::default().fg(DIM),
+    ));
+}
+
+fn quota_separator() -> Span<'static> {
+    Span::styled("  │  ", Style::default().fg(SEPARATOR))
+}
+
+fn quota_remaining_percent(window: &ProviderQuotaWindow) -> f64 {
+    (100.0 - window.used_percent).clamp(0.0, 100.0)
+}
+
+fn quota_remaining_color(remaining: f64) -> Color {
+    if remaining <= 10.0 {
+        RED
+    } else if remaining <= 25.0 {
+        YELLOW
+    } else {
+        TEAL
+    }
+}
+
+fn quota_reset_label(window: &ProviderQuotaWindow, now: SystemTime) -> Option<String> {
+    let remaining = window
+        .resets_at?
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO);
+    let seconds = remaining.as_secs();
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    Some(if days > 0 {
+        format!("{days}d{hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    })
+}
+
+fn credits_label(credits: ProviderCredits) -> Option<(&'static str, Color)> {
+    if credits.unlimited == Some(true) {
+        Some(("credits unlimited", GREEN))
+    } else if credits.has_credits == Some(true) {
+        Some(("credits available", GREEN))
+    } else if credits.has_credits == Some(false) {
+        Some(("credits exhausted", RED))
+    } else {
+        None
+    }
 }
 
 fn panel(title: &'static str, focused: bool) -> Block<'static> {
@@ -2163,6 +2400,84 @@ mod tests {
         let wide = render_at(SESSION_SPARKLINE_MIN_WIDTH);
         assert!(wide.contains("Tokens/10s · 4k"), "{wide}");
         assert!(spark_chars(&wide) > 0, "{wide}");
+    }
+
+    #[test]
+    fn subscription_usage_responsively_preserves_quota_meaning() {
+        let state = mock_state();
+        let quota = state.provider_quotas.get("codex").unwrap();
+        let render_at = |width| {
+            let buffer = draw(width, 3, |frame| {
+                render_subscription_usage(frame, frame.area(), quota)
+            });
+            buffer_text(&buffer)
+        };
+
+        let emergency = render_at(77);
+        assert!(emergency.contains("Subscription usage"), "{emergency}");
+        assert!(emergency.contains("Week 41% left"), "{emergency}");
+        assert!(!emergency.contains("5h"), "{emergency}");
+
+        let narrow = render_at(78);
+        assert!(narrow.contains("5h 72%"), "{narrow}");
+        assert!(narrow.contains("Week 41%"), "{narrow}");
+        assert!(!narrow.contains('█'), "{narrow}");
+
+        let medium = render_at(90);
+        assert!(medium.contains("5h 72% left"), "{medium}");
+        assert!(medium.contains("reset"), "{medium}");
+
+        let expanded = render_at(120);
+        assert!(expanded.contains('█'), "{expanded}");
+        assert!(expanded.contains("credits available"), "{expanded}");
+
+        let wide = render_at(180);
+        assert!(wide.contains("72% left"), "{wide}");
+        assert!(wide.contains("41% left"), "{wide}");
+        assert!(wide.contains("updated 3s ago"), "{wide}");
+    }
+
+    #[test]
+    fn monitor_hides_subscription_panel_until_a_quota_snapshot_arrives() {
+        let state = MonitorHandle::new(10).snapshot();
+        let mut app = MonitorApp {
+            listen_url: "mock://tui-demo".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: None,
+        };
+
+        let screen = draw(120, 30, |frame| render(frame, &mut app, &state));
+        assert!(!buffer_text(&screen).contains("Subscription usage"));
+    }
+
+    #[test]
+    fn quota_values_are_clamped_and_reset_countdown_never_goes_negative() {
+        let low = ProviderQuotaWindow {
+            used_percent: 150.0,
+            window_minutes: 300,
+            resets_at: Some(SystemTime::UNIX_EPOCH),
+        };
+        let high = ProviderQuotaWindow {
+            used_percent: -25.0,
+            window_minutes: 10_080,
+            resets_at: None,
+        };
+
+        assert_eq!(quota_remaining_percent(&low), 0.0);
+        assert_eq!(quota_remaining_percent(&high), 100.0);
+        assert_eq!(
+            quota_reset_label(&low, SystemTime::now()).as_deref(),
+            Some("0m")
+        );
     }
 
     #[test]

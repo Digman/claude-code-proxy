@@ -177,6 +177,7 @@ impl StreamState {
         if let Some(traffic) = self.ctx.traffic.as_deref() {
             traffic.write_json_event("040-upstream-event", &event);
         }
+        super::super::events::record_rate_limit_snapshot(self.ctx.monitor.as_ref(), &event);
         match self.completion.observe(&event) {
             Ok(Some(delta)) => {
                 if !self.role_sent {

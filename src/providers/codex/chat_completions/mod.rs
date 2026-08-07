@@ -77,6 +77,7 @@ impl ChatCompletionsBackend {
         if let Some(traffic) = ctx.traffic.as_deref() {
             traffic.write_bytes("032-upstream-response-body.sse", &bytes);
         }
+        super::events::record_rate_limit_snapshots_from_sse(ctx.monitor.as_ref(), &bytes);
         let completion = match response::aggregate_sse(&bytes, &request.model) {
             Ok(completion) => completion,
             Err(error) => return error.response(),

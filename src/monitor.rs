@@ -126,6 +126,13 @@ pub enum MonitorEvent {
         request_id: String,
         error: String,
     },
+    /// Merges an account quota snapshot into the state for one provider.
+    ProviderQuotaUpdated {
+        provider: String,
+        windows: Vec<ProviderQuotaWindow>,
+        limit_reached: bool,
+        credits: ProviderCredits,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -235,9 +242,38 @@ impl Throughput {
 #[derive(Debug, Clone)]
 pub struct MonitorState {
     pub started_at: SystemTime,
+    /// Latest account quota snapshots keyed by provider identifier.
+    pub provider_quotas: HashMap<String, ProviderQuota>,
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
+}
+
+/// Latest account-level quota state observed for one provider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderQuota {
+    pub windows: Vec<ProviderQuotaWindow>,
+    pub limit_reached: bool,
+    pub credits: ProviderCredits,
+    /// Time of the latest valid quota event; individual windows may be merged from earlier events.
+    pub updated_at: SystemTime,
+}
+
+/// Usage and reset metadata for one provider-defined quota window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderQuotaWindow {
+    /// Percentage already consumed, as reported by the provider.
+    pub used_percent: f64,
+    pub window_minutes: u64,
+    pub resets_at: Option<SystemTime>,
+}
+
+/// Optional account credit fields included with a provider quota event.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProviderCredits {
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub balance: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +317,7 @@ struct MonitorStore {
     started_at: SystemTime,
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
+    provider_quotas: HashMap<String, ProviderQuota>,
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
@@ -310,6 +347,7 @@ impl MonitorHandle {
                 started_at: SystemTime::now(),
                 active: HashMap::new(),
                 recent: VecDeque::new(),
+                provider_quotas: HashMap::new(),
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
@@ -328,6 +366,7 @@ impl MonitorHandle {
             Ok(store) => store.snapshot(),
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
+                provider_quotas: HashMap::new(),
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
@@ -473,6 +512,24 @@ impl MonitorHandle {
         self.publish(MonitorEvent::RequestAbandoned {
             request_id: request_id.into(),
             error: error.into(),
+        });
+    }
+
+    /// Publishes quota windows and sparse credit fields for one provider.
+    ///
+    /// Existing windows are replaced by duration. Empty windows do not create an initial snapshot.
+    pub fn provider_quota_updated(
+        &self,
+        provider: impl Into<String>,
+        windows: Vec<ProviderQuotaWindow>,
+        limit_reached: bool,
+        credits: ProviderCredits,
+    ) {
+        self.publish(MonitorEvent::ProviderQuotaUpdated {
+            provider: provider.into(),
+            windows,
+            limit_reached,
+            credits,
         });
     }
 }
@@ -723,6 +780,48 @@ impl MonitorStore {
                     Some(error),
                 );
             }
+            MonitorEvent::ProviderQuotaUpdated {
+                provider,
+                windows,
+                limit_reached,
+                credits,
+            } => {
+                let updated_at = SystemTime::now();
+                if let Some(quota) = self.provider_quotas.get_mut(&provider) {
+                    for window in windows {
+                        if let Some(existing) = quota
+                            .windows
+                            .iter_mut()
+                            .find(|existing| existing.window_minutes == window.window_minutes)
+                        {
+                            *existing = window;
+                        } else {
+                            quota.windows.push(window);
+                        }
+                    }
+                    quota.limit_reached = limit_reached;
+                    if credits.has_credits.is_some() {
+                        quota.credits.has_credits = credits.has_credits;
+                    }
+                    if credits.unlimited.is_some() {
+                        quota.credits.unlimited = credits.unlimited;
+                    }
+                    if credits.balance.is_some() {
+                        quota.credits.balance = credits.balance;
+                    }
+                    quota.updated_at = updated_at;
+                } else if !windows.is_empty() {
+                    self.provider_quotas.insert(
+                        provider,
+                        ProviderQuota {
+                            windows,
+                            limit_reached,
+                            credits,
+                            updated_at,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -869,6 +968,7 @@ impl MonitorStore {
         );
         MonitorState {
             started_at: self.started_at,
+            provider_quotas: self.provider_quotas.clone(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
@@ -1073,6 +1173,60 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_quota_updates_merge_windows_and_isolate_providers() {
+        let monitor = MonitorHandle::new(10);
+        monitor.provider_quota_updated(
+            "codex",
+            vec![ProviderQuotaWindow {
+                used_percent: 25.0,
+                window_minutes: 300,
+                resets_at: None,
+            }],
+            false,
+            ProviderCredits {
+                has_credits: Some(true),
+                unlimited: Some(false),
+                balance: None,
+            },
+        );
+        monitor.provider_quota_updated(
+            "codex",
+            vec![ProviderQuotaWindow {
+                used_percent: 60.0,
+                window_minutes: 10_080,
+                resets_at: None,
+            }],
+            false,
+            ProviderCredits::default(),
+        );
+        monitor.provider_quota_updated(
+            "kimi",
+            vec![ProviderQuotaWindow {
+                used_percent: 10.0,
+                window_minutes: 60,
+                resets_at: None,
+            }],
+            false,
+            ProviderCredits::default(),
+        );
+
+        let state = monitor.snapshot();
+        let codex = state.provider_quotas.get("codex").unwrap();
+        assert_eq!(codex.windows.len(), 2);
+        assert_eq!(codex.credits.has_credits, Some(true));
+        assert_eq!(codex.credits.unlimited, Some(false));
+        assert_eq!(state.provider_quotas["kimi"].windows.len(), 1);
+    }
+
+    #[test]
+    fn empty_quota_update_does_not_create_a_panel() {
+        let monitor = MonitorHandle::new(10);
+        monitor.provider_quota_updated("codex", Vec::new(), false, ProviderCredits::default());
+
+        assert!(!monitor.snapshot().provider_quotas.contains_key("codex"));
+    }
 
     #[test]
     fn started_requests_appear_active() {

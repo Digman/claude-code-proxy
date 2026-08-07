@@ -453,6 +453,7 @@ impl NativeResponseObserver {
     }
 
     fn record_event(&mut self, event: Option<&str>, value: Value) {
+        super::events::record_rate_limit_snapshot(self.ctx.monitor.as_ref(), &value);
         self.update_usage(&value);
         self.update_outcome(&value);
         let mut captured = value;

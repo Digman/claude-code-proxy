@@ -1,4 +1,8 @@
+use std::time::{Duration, SystemTime};
+
 use serde_json::Value;
+
+use crate::monitor::{MonitorHandle, ProviderCredits, ProviderQuotaWindow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
@@ -21,6 +25,79 @@ impl CodexEventFailure {
     pub fn retryable(&self) -> bool {
         !matches!(self.kind, CodexFailureKind::Permanent)
     }
+}
+
+pub(crate) fn record_rate_limit_snapshots_from_sse(monitor: Option<&MonitorHandle>, body: &[u8]) {
+    for event in crate::anthropic::sse::parse_sse_events(body) {
+        if let Ok(payload) = serde_json::from_str::<Value>(&event.data) {
+            record_rate_limit_snapshot(monitor, &payload);
+        }
+    }
+}
+
+pub(crate) fn record_rate_limit_snapshot(monitor: Option<&MonitorHandle>, payload: &Value) {
+    let Some((windows, limit_reached, credits)) = rate_limit_snapshot(payload) else {
+        return;
+    };
+    if let Some(monitor) = monitor {
+        monitor.provider_quota_updated("codex", windows, limit_reached, credits);
+    }
+}
+
+fn rate_limit_snapshot(
+    payload: &Value,
+) -> Option<(Vec<ProviderQuotaWindow>, bool, ProviderCredits)> {
+    if payload.get("type").and_then(Value::as_str) != Some("codex.rate_limits") {
+        return None;
+    }
+    let rate_limits = payload.get("rate_limits")?;
+    let windows = ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|name| rate_limit_window(rate_limits.get(name)?))
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        return None;
+    }
+    let credits = payload.get("credits");
+    Some((
+        windows,
+        rate_limits
+            .get("limit_reached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ProviderCredits {
+            has_credits: credits
+                .and_then(|value| value.get("has_credits"))
+                .and_then(Value::as_bool),
+            unlimited: credits
+                .and_then(|value| value.get("unlimited"))
+                .and_then(Value::as_bool),
+            balance: credits
+                .and_then(|value| value.get("balance"))
+                .and_then(Value::as_f64),
+        },
+    ))
+}
+
+fn rate_limit_window(window: &Value) -> Option<ProviderQuotaWindow> {
+    let used_percent = window.get("used_percent")?.as_f64()?;
+    let window_minutes = window.get("window_minutes")?.as_u64()?;
+    let resets_at = window
+        .get("reset_at")
+        .and_then(Value::as_u64)
+        .and_then(|timestamp| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(timestamp)))
+        .or_else(|| {
+            window
+                .get("reset_after_seconds")
+                .and_then(Value::as_f64)
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                .and_then(|duration| SystemTime::now().checked_add(duration))
+        });
+    Some(ProviderQuotaWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
 }
 
 pub(crate) fn is_terminal_rate_limit_event(payload: &Value) -> bool {
@@ -200,6 +277,74 @@ fn retryable_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_account_quota_windows_and_credits() {
+        let reset_at = 4_102_444_800_u64;
+        let (windows, limit_reached, credits) = rate_limit_snapshot(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "limit_reached": false,
+                "primary": {
+                    "used_percent": 28.5,
+                    "window_minutes": 300,
+                    "reset_at": reset_at
+                },
+                "secondary": {
+                    "used_percent": 59,
+                    "window_minutes": 10080,
+                    "reset_after_seconds": 3600
+                }
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": 12.5
+            }
+        }))
+        .unwrap();
+
+        assert!(!limit_reached);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].used_percent, 28.5);
+        assert_eq!(windows[0].window_minutes, 300);
+        assert_eq!(
+            windows[0].resets_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(reset_at))
+        );
+        assert_eq!(windows[1].window_minutes, 10_080);
+        assert!(windows[1].resets_at.is_some());
+        assert_eq!(credits.has_credits, Some(true));
+        assert_eq!(credits.unlimited, Some(false));
+        assert_eq!(credits.balance, Some(12.5));
+    }
+
+    #[test]
+    fn ignores_non_quota_and_incomplete_windows() {
+        assert!(rate_limit_snapshot(&serde_json::json!({"type": "keepalive"})).is_none());
+        assert!(
+            rate_limit_snapshot(&serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 25},
+                    "secondary": {"window_minutes": 10080}
+                }
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_reset_durations_without_panicking() {
+        let window = rate_limit_window(&serde_json::json!({
+            "used_percent": 25,
+            "window_minutes": 300,
+            "reset_after_seconds": 1e300
+        }))
+        .unwrap();
+
+        assert_eq!(window.resets_at, None);
+    }
 
     #[test]
     fn classifies_retryable_failure_kinds() {

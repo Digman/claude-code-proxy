@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionUsage,
-    session_summaries,
+    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, ProviderCredits, ProviderQuota,
+    ProviderQuotaWindow, RequestStatus, SessionUsage, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -371,6 +371,30 @@ fn mock_state_for_tick(
     let sessions = session_summaries(&active, &recent, &session_usage, output_buckets);
     MonitorState {
         started_at,
+        provider_quotas: HashMap::from([(
+            "codex".to_string(),
+            ProviderQuota {
+                windows: vec![
+                    ProviderQuotaWindow {
+                        used_percent: 28.0,
+                        window_minutes: 300,
+                        resets_at: Some(now + Duration::from_secs(6_180)),
+                    },
+                    ProviderQuotaWindow {
+                        used_percent: 59.0,
+                        window_minutes: 10_080,
+                        resets_at: Some(now + Duration::from_secs(507_600)),
+                    },
+                ],
+                limit_reached: false,
+                credits: ProviderCredits {
+                    has_credits: Some(true),
+                    unlimited: Some(false),
+                    balance: None,
+                },
+                updated_at: now - Duration::from_secs(3),
+            },
+        )]),
         sessions,
         active,
         recent: recent.into_iter().collect(),
@@ -777,6 +801,8 @@ mod tests {
                 .iter()
                 .any(|session| session.session_id.is_none())
         );
+        assert!(state.provider_quotas.contains_key("codex"));
+        assert!(!state.provider_quotas.contains_key("kimi"));
     }
 
     #[test]
