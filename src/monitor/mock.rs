@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, ProviderCredits, ProviderQuota,
-    ProviderQuotaWindow, RequestStatus, SessionUsage, session_summaries,
+    ActiveRequest, CompletedRequest, EgressState, EndpointKind, MonitorState, ProviderCredits,
+    ProviderQuota, ProviderQuotaWindow, RequestStatus, SessionUsage, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -394,6 +394,10 @@ fn mock_state_for_tick(
                 },
                 updated_at: now - Duration::from_secs(3),
             },
+        )]),
+        provider_egress: HashMap::from([(
+            "codex".to_string(),
+            EgressState::Available("178.249.214.12".to_string()),
         )]),
         sessions,
         active,

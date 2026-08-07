@@ -60,6 +60,24 @@ impl RequestStatus {
     }
 }
 
+/// Latest observed public egress state for a provider route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressState {
+    Resolving,
+    Available(String),
+    Unavailable,
+}
+
+impl EgressState {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Resolving => "…",
+            Self::Available(address) => address,
+            Self::Unavailable => "-",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
     RequestStarted {
@@ -125,6 +143,10 @@ pub enum MonitorEvent {
     RequestAbandoned {
         request_id: String,
         error: String,
+    },
+    ProviderEgressUpdated {
+        provider: String,
+        state: EgressState,
     },
     /// Merges an account quota snapshot into the state for one provider.
     ProviderQuotaUpdated {
@@ -244,6 +266,8 @@ pub struct MonitorState {
     pub started_at: SystemTime,
     /// Latest account quota snapshots keyed by provider identifier.
     pub provider_quotas: HashMap<String, ProviderQuota>,
+    /// Latest independently observed public egress keyed by provider identifier.
+    pub provider_egress: HashMap<String, EgressState>,
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
@@ -318,6 +342,7 @@ struct MonitorStore {
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
     provider_quotas: HashMap<String, ProviderQuota>,
+    provider_egress: HashMap<String, EgressState>,
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
@@ -348,6 +373,7 @@ impl MonitorHandle {
                 active: HashMap::new(),
                 recent: VecDeque::new(),
                 provider_quotas: HashMap::new(),
+                provider_egress: HashMap::new(),
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
@@ -367,6 +393,7 @@ impl MonitorHandle {
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
                 provider_quotas: HashMap::new(),
+                provider_egress: HashMap::new(),
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
@@ -512,6 +539,14 @@ impl MonitorHandle {
         self.publish(MonitorEvent::RequestAbandoned {
             request_id: request_id.into(),
             error: error.into(),
+        });
+    }
+
+    /// Publishes an independently observed public egress without affecting request state.
+    pub fn provider_egress_updated(&self, provider: impl Into<String>, state: EgressState) {
+        self.publish(MonitorEvent::ProviderEgressUpdated {
+            provider: provider.into(),
+            state,
         });
     }
 
@@ -780,6 +815,9 @@ impl MonitorStore {
                     Some(error),
                 );
             }
+            MonitorEvent::ProviderEgressUpdated { provider, state } => {
+                self.provider_egress.insert(provider, state);
+            }
             MonitorEvent::ProviderQuotaUpdated {
                 provider,
                 windows,
@@ -969,6 +1007,7 @@ impl MonitorStore {
         MonitorState {
             started_at: self.started_at,
             provider_quotas: self.provider_quotas.clone(),
+            provider_egress: self.provider_egress.clone(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
@@ -1226,6 +1265,24 @@ mod tests {
         monitor.provider_quota_updated("codex", Vec::new(), false, ProviderCredits::default());
 
         assert!(!monitor.snapshot().provider_quotas.contains_key("codex"));
+    }
+
+    #[test]
+    fn provider_egress_updates_are_isolated() {
+        let monitor = MonitorHandle::new(10);
+        monitor.provider_egress_updated("codex", EgressState::Resolving);
+        monitor.provider_egress_updated(
+            "codex",
+            EgressState::Available("178.249.214.12".to_string()),
+        );
+        monitor.provider_egress_updated("kimi", EgressState::Unavailable);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.provider_egress["codex"],
+            EgressState::Available("178.249.214.12".to_string())
+        );
+        assert_eq!(state.provider_egress["kimi"], EgressState::Unavailable);
     }
 
     #[test]

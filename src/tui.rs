@@ -1,10 +1,10 @@
 mod layout;
 
 use layout::{
-    CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH,
-    ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH,
-    PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH,
-    TOKEN_WIDTH,
+    CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, EGRESS_WIDTH,
+    ENDPOINT_WIDTH, ERROR_WIDTH, ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH,
+    MODEL_WIDE_WIDTH, PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH,
+    STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
 };
 
 use std::{
@@ -32,8 +32,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState, ProviderCredits,
-        ProviderQuota, ProviderQuotaWindow, SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        ActiveRequest, CompletedRequest, EgressState, MockMonitor, MonitorHandle, MonitorState,
+        ProviderCredits, ProviderQuota, ProviderQuotaWindow, SESSION_TOKEN_BUCKET_SECS,
+        SessionSummary,
     },
     paths,
     registry::Registry,
@@ -54,6 +55,7 @@ const PURPLE: Color = Color::Rgb(190, 140, 240);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
+const ACTIVE_EGRESS_MIN_WIDTH: u16 = 188;
 
 pub struct MonitorUiConfig<'a> {
     pub listen_url: String,
@@ -412,7 +414,13 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             app.focus == FocusPane::Sessions,
         ),
     }
-    render_active(frame, root[2 + content_offset], &state.active, app.tick);
+    render_active(
+        frame,
+        root[2 + content_offset],
+        &state.active,
+        &state.provider_egress,
+        app.tick,
+    );
     render_recent(
         frame,
         root[3 + content_offset],
@@ -1196,6 +1204,7 @@ enum ActiveColumn {
     Target,
     Effort,
     Endpoint,
+    Egress,
     Input,
     Output,
     Rate,
@@ -1259,10 +1268,31 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
     }
 }
 
+fn active_columns_for_width(width: u16) -> Vec<ColumnSpec<ActiveColumn>> {
+    let mut columns = active_columns(LayoutTier::for_outer_width(width));
+    if width >= ACTIVE_EGRESS_MIN_WIDTH {
+        let index = columns
+            .iter()
+            .position(|column| column.key == ActiveColumn::Endpoint)
+            .expect("wide active schema must contain Endpoint");
+        columns.insert(
+            index + 1,
+            ColumnSpec::fixed(
+                ActiveColumn::Egress,
+                "Egress",
+                Alignment::Left,
+                EGRESS_WIDTH,
+            ),
+        );
+    }
+    columns
+}
+
 fn render_active(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     active: &[ActiveRequest],
+    provider_egress: &HashMap<String, EgressState>,
     tick: usize,
 ) {
     if active.is_empty() {
@@ -1270,7 +1300,7 @@ fn render_active(
         return;
     }
 
-    let columns = active_columns(LayoutTier::for_outer_width(area.width));
+    let columns = active_columns_for_width(area.width);
     let widths = column_constraints(&columns);
     let rows = active.iter().map(|request| {
         let status = if request.status == crate::monitor::RequestStatus::Compacting {
@@ -1302,6 +1332,16 @@ fn render_active(
                     }
                     ActiveColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     ActiveColumn::Endpoint => muted_cell(request.endpoint.label()),
+                    ActiveColumn::Egress => {
+                        let label = match request.provider.as_deref() {
+                            Some(provider) => provider_egress
+                                .get(provider)
+                                .map(EgressState::label)
+                                .unwrap_or("-"),
+                            None => "…",
+                        };
+                        muted_cell(ellipsize(label, width))
+                    }
                     ActiveColumn::Input => number_cell(token_value(request.input_tokens)),
                     ActiveColumn::Output => number_cell(token_value(request.output_tokens)),
                     ActiveColumn::Rate => rate_cell(request.rate().label()),
@@ -2168,7 +2208,13 @@ mod tests {
         let state = mock_state();
         let render_at = |width| {
             let buffer = draw(width, 8, |frame| {
-                render_active(frame, frame.area(), &state.active, 0)
+                render_active(
+                    frame,
+                    frame.area(),
+                    &state.active,
+                    &state.provider_egress,
+                    0,
+                )
             });
             buffer_text(&buffer)
         };
@@ -2188,19 +2234,48 @@ mod tests {
         assert!(medium.contains("Provider"), "{medium}");
         assert!(medium.contains("Model"), "{medium}");
         assert!(medium.contains("Endpoint"), "{medium}");
+        assert!(!medium.contains("Egress"), "{medium}");
         assert!(!medium.contains("Project"), "{medium}");
 
         let expanded = render_at(120);
         assert!(expanded.contains("Project"), "{expanded}");
         assert!(expanded.contains("Session"), "{expanded}");
         assert!(expanded.contains("Endpoint"), "{expanded}");
+        assert!(!expanded.contains("Egress"), "{expanded}");
         assert!(!expanded.contains("In"), "{expanded}");
 
         let wide = render_at(154);
         assert!(wide.contains("Project"), "{wide}");
         assert!(wide.contains("Session"), "{wide}");
+        assert!(!wide.contains("Egress"), "{wide}");
         assert!(wide.contains("In"), "{wide}");
         assert!(wide.contains("Out"), "{wide}");
+
+        let with_egress = render_at(ACTIVE_EGRESS_MIN_WIDTH);
+        assert!(with_egress.contains("Egress"), "{with_egress}");
+        assert!(with_egress.contains("178.249.214.12"), "{with_egress}");
+    }
+
+    #[test]
+    fn wide_active_table_keeps_full_ipv6_egress() {
+        let mut state = mock_state();
+        let address = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+        state.provider_egress.insert(
+            "codex".to_string(),
+            EgressState::Available(address.to_string()),
+        );
+
+        let buffer = draw(ACTIVE_EGRESS_MIN_WIDTH, 8, |frame| {
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
+        });
+
+        assert!(buffer_text(&buffer).contains(address));
     }
 
     #[test]
@@ -2606,7 +2681,10 @@ mod tests {
         assert!(!sessions_text.contains("provider"));
         assert!(sessions_text.contains("No sessions"));
 
-        let active = draw(27, 6, |frame| render_active(frame, frame.area(), &[], 0));
+        let provider_egress = HashMap::new();
+        let active = draw(27, 6, |frame| {
+            render_active(frame, frame.area(), &[], &provider_egress, 0)
+        });
         let active_text = buffer_text(&active);
         assert_centered(&active, "No active requests", 2);
         assert!(!active_text.contains("started"));
@@ -2635,7 +2713,13 @@ mod tests {
         let state = monitor.snapshot();
 
         let active = draw(88, 6, |frame| {
-            render_active(frame, frame.area(), &state.active, 0)
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
         });
 
         let active_text = buffer_text(&active);
@@ -2650,7 +2734,13 @@ mod tests {
         let state = monitor.snapshot();
 
         let active = draw(88, 6, |frame| {
-            render_active(frame, frame.area(), &state.active, 0)
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
         });
 
         let active_text = buffer_text(&active);
@@ -2687,7 +2777,13 @@ mod tests {
         assert!(!sessions_text.contains("No sessions"));
 
         let active = draw(120, 8, |frame| {
-            render_active(frame, frame.area(), &active_state.active, 0)
+            render_active(
+                frame,
+                frame.area(),
+                &active_state.active,
+                &active_state.provider_egress,
+                0,
+            )
         });
         let active_text = buffer_text(&active);
         assert!(active_text.contains("Started"));

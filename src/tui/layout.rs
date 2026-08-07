@@ -12,6 +12,7 @@ pub const PROJECT_MEDIUM_WIDTH: u16 = 12;
 pub const PROJECT_WIDE_WIDTH: u16 = 16;
 pub const EFFORT_WIDTH: u16 = 6;
 pub const ENDPOINT_WIDTH: u16 = 12;
+pub const EGRESS_WIDTH: u16 = 39;
 pub const STATUS_WIDTH: u16 = 11;
 pub const RATE_WIDTH: u16 = 12;
 pub const DURATION_WIDTH: u16 = 8;

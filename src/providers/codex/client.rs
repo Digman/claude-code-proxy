@@ -516,7 +516,7 @@ const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Clone)]
-struct ProxyEnvironment {
+pub(crate) struct ProxyEnvironment {
     http_proxy: Option<String>,
     https_proxy: Option<String>,
     all_proxy: Option<String>,
@@ -526,31 +526,32 @@ struct ProxyEnvironment {
 
 impl ProxyEnvironment {
     fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|name| panic!("invalid {name} proxy URL"))
+    }
+
+    pub(crate) fn try_from_env() -> Result<Self, &'static str> {
         if std::env::var_os("REQUEST_METHOD").is_some() {
-            return Self {
+            return Ok(Self {
                 http_proxy: None,
                 https_proxy: None,
                 all_proxy: None,
                 no_proxy: None,
                 no_proxy_value: None,
-            };
+            });
         }
 
         let no_proxy_value = std::env::var("NO_PROXY")
             .or_else(|_| std::env::var("no_proxy"))
             .ok();
-        Self {
-            http_proxy: proxy_env_value("HTTP_PROXY", "http_proxy")
-                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
-            https_proxy: proxy_env_value("HTTPS_PROXY", "https_proxy")
-                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
-            all_proxy: proxy_env_value("ALL_PROXY", "all_proxy")
-                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+        Ok(Self {
+            http_proxy: proxy_env_value("HTTP_PROXY", "http_proxy")?,
+            https_proxy: proxy_env_value("HTTPS_PROXY", "https_proxy")?,
+            all_proxy: proxy_env_value("ALL_PROXY", "all_proxy")?,
             no_proxy: no_proxy_value
                 .as_deref()
                 .and_then(reqwest::NoProxy::from_string),
             no_proxy_value,
-        }
+        })
     }
 
     fn websocket_proxy_config(&self) -> super::websocket::WebSocketProxyConfig {
@@ -562,7 +563,7 @@ impl ProxyEnvironment {
         )
     }
 
-    fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    pub(crate) fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder = builder.no_proxy();
         if let Some(proxy) = self.http_proxy.as_deref() {
             builder = builder.proxy(

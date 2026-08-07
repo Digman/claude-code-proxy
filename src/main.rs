@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config, logging,
+    config, egress, logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -122,6 +122,7 @@ fn main() -> Result<()> {
                     let local_addr = listener.local_addr()?;
                     let monitor_listen_url =
                         listen_url(&local_addr.ip().to_string(), local_addr.port());
+                    let egress_task = runtime.spawn(egress::refresh_codex_egress(monitor.clone()));
                     let server_monitor = monitor.clone();
                     let server_task = runtime.spawn(async move {
                         let result =
@@ -143,11 +144,16 @@ fn main() -> Result<()> {
                         },
                     );
                     if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
+                        egress_task.abort();
                         server_task.abort();
+                        let _ = runtime.block_on(egress_task);
                         let _ = runtime.block_on(server_task);
                         std::process::exit(130);
                     }
-                    let server_result = runtime.block_on(server_task)?;
+                    let server_result = runtime.block_on(server_task);
+                    egress_task.abort();
+                    let _ = runtime.block_on(egress_task);
+                    let server_result = server_result?;
                     ui_result?;
                     server_result.map_err(|err| anyhow::anyhow!(err))
                 }
