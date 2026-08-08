@@ -57,6 +57,8 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -257,6 +259,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_LOG_STDERR") {
         out.push("log.stderr (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
@@ -351,6 +356,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 .is_some_and(|value| !value.is_empty())
             {
                 out.push("codex.reasoningSummary (config)".to_string());
+            }
+            if codex.full_lane == Some(true) {
+                out.push("codex.fullLane: true".to_string());
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
@@ -640,6 +648,23 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+/// Routes `gpt-5.6-sol` and `gpt-5.6-terra` through the full Codex Responses
+/// lane when enabled. `gpt-5.6-luna` remains Lite-only at the lane selector.
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
@@ -924,6 +949,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CODEX_FULL_LANE");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_API");
@@ -1112,6 +1138,47 @@ mod tests {
         let loaded = load_config_for_env(&env);
         assert!(loaded.log_verbose);
         assert!(loaded.log_stderr);
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_off_and_env_overrides_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        assert!(
+            config_override_summary_lines(&load_config())
+                .contains(&"codex.fullLane: true".to_string())
+        );
+
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        assert!(!codex_full_lane());
+        assert!(
+            config_override_summary_lines(&load_config())
+                .contains(&"codex.fullLane (env)".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_full_lane_accepts_enabled_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for value in ["1", "true", "TRUE", "yes"] {
+            let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
     }
 
     #[test]

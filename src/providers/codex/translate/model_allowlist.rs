@@ -116,8 +116,20 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// The gpt-5.6 family defaults to Responses Lite, whose protocol requires
+/// serialized tool calls. The opt-in full lane enables parallel tool calls for
+/// Sol and Terra; Luna remains Lite-only because the full lane resolves it to
+/// an unavailable `-free` model.
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
+    uses_responses_lite_with_full_lane(model, config::codex_full_lane())
+}
+
+fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    match model {
+        "gpt-5.6-luna" => true,
+        "gpt-5.6-sol" | "gpt-5.6-terra" => !full_lane,
+        _ => false,
+    }
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -151,6 +163,23 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn responses_lite_defaults_for_56_family_only() {
+        for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert!(uses_responses_lite_with_full_lane(model, false));
+        }
+        for model in ["gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, false));
+        }
+    }
+
+    #[test]
+    fn full_lane_enables_sol_and_terra_but_not_luna() {
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.6-sol", true));
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.6-terra", true));
+        assert!(uses_responses_lite_with_full_lane("gpt-5.6-luna", true));
     }
 
     #[test]

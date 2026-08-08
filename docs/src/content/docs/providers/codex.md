@@ -24,6 +24,12 @@ Use `claude-code-proxy models` as the current catalog. Model access depends on y
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-5.6-sol-fast` selects `gpt-5.6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
+## Responses lanes and parallel tools
+
+The gpt-5.6 family uses Responses Lite by default. Lite requires serialized tool calls, so independent Claude Code tools are emitted across separate model turns. Set `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` to route `gpt-5.6-sol` and `gpt-5.6-terra` through full Responses, where the proxy preserves the request's parallel-tool policy.
+
+`gpt-5.6-luna` always remains on Lite because it is unavailable on the full lane. The setting is disabled by default and does not change other Codex models. Full Responses uses an internal ChatGPT interface, so availability and quota behavior remain account-dependent.
+
 ## Reasoning
 
 Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. A proxy override can also force `none`.

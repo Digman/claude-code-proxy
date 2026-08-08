@@ -25,6 +25,7 @@ These settings configure the proxy process. Claude Code client settings such as 
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "websocket",
     "previousResponseId": false,
+    "fullLane": false,
     "serverCompaction": false,
     "responsesApi": false,
     "imagesApi": false,
@@ -109,6 +110,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_BASE_URL` | `codex.baseUrl` | ChatGPT Codex Responses URL | Changes the Codex endpoint. |
 | `CCP_CODEX_TRANSPORT` | `codex.transport` | `websocket` | Selects `websocket`, `http`, or `auto`. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
+| `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Routes `gpt-5.6-sol` and `gpt-5.6-terra` through full Responses for parallel tool calls. Luna remains on Responses Lite. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |

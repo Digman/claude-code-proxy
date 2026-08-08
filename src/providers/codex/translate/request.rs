@@ -492,6 +492,8 @@ fn translate_request_inner(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
             "true".to_string(),
         )]));
+        // The Lite lane rejects `parallel_tool_calls: true`; full-lane requests
+        // retain the client policy set above.
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();
