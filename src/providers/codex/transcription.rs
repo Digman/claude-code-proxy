@@ -124,15 +124,15 @@ impl CodexTranscriptionBackend {
             copy_safe_headers(&headers, response.headers_mut());
             return response;
         }
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.first_response(&ctx.req_id);
+        }
         let body = match collect_response_body(upstream, self.client.body_idle_timeout_ms()).await {
             Ok(body) => body,
             Err(error) => return transcription_error_response(error),
         };
         if let Err(error) = validate_success_response(&body) {
             return transcription_error_response(error);
-        }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.generation_started(&ctx.req_id);
         }
         let mut response = (
             StatusCode::OK,
@@ -471,6 +471,15 @@ mod tests {
             std::sync::Arc::new(client),
             format!("http://{addr}/root"),
         );
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "transcription-test",
+            None,
+            None,
+            crate::monitor::EndpointKind::Transcriptions,
+        );
+        let mut ctx = context();
+        ctx.monitor = Some(monitor.clone());
         let response = backend
             .handle(
                 prepare_transcription(
@@ -480,12 +489,20 @@ mod tests {
                     Some("en".to_string()),
                 )
                 .unwrap(),
-                context(),
+                ctx,
             )
             .await;
         server.await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let state = monitor.snapshot();
+        let request = state
+            .active
+            .iter()
+            .find(|request| request.request_id == "transcription-test")
+            .unwrap();
+        assert!(request.ttfb.is_some());
+        assert!(request.generation_started_at.is_none());
         assert_eq!(response.headers()["x-request-id"], "upstream-transcribe");
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await

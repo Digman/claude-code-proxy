@@ -1207,6 +1207,7 @@ enum ActiveColumn {
     Input,
     Output,
     Rate,
+    Ttfb,
     Elapsed,
 }
 
@@ -1328,6 +1329,25 @@ fn active_columns_for_width(width: u16, egress_width: u16) -> Vec<ColumnSpec<Act
             ),
         );
     }
+
+    if columns
+        .iter()
+        .any(|column| column.key == ActiveColumn::Egress)
+    {
+        let required_inner_width = fixed_column_budget(&columns)
+            .saturating_add(1)
+            .saturating_add(DURATION_WIDTH);
+        if inner_width >= required_inner_width {
+            let index = columns
+                .iter()
+                .position(|column| column.key == ActiveColumn::Elapsed)
+                .expect("wide active schema must contain Elapsed");
+            columns.insert(
+                index,
+                ColumnSpec::fixed(ActiveColumn::Ttfb, "TTFB", Alignment::Right, DURATION_WIDTH),
+            );
+        }
+    }
     columns
 }
 
@@ -1389,7 +1409,15 @@ fn render_active(
                     ActiveColumn::Input => number_cell(token_value(request.input_tokens)),
                     ActiveColumn::Output => number_cell(token_value(request.output_tokens)),
                     ActiveColumn::Rate => rate_cell(request.rate().label()),
-                    ActiveColumn::Elapsed => number_cell(format_duration(request.elapsed())),
+                    ActiveColumn::Ttfb => number_cell(
+                        request
+                            .ttfb
+                            .map(format_request_duration)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    ActiveColumn::Elapsed => {
+                        number_cell(format_request_duration(request.elapsed()))
+                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -1412,6 +1440,7 @@ enum RecentColumn {
     Target,
     Effort,
     Endpoint,
+    Ttfb,
     Latency,
     Rate,
     Input,
@@ -1485,6 +1514,27 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
     }
 }
 
+fn recent_columns_for_width(width: u16) -> Vec<ColumnSpec<RecentColumn>> {
+    let tier = LayoutTier::for_outer_width(width);
+    let mut columns = recent_columns(tier);
+    // Preserve a readable Details cell instead of replacing its flex space at the threshold.
+    let required_inner_width = fixed_column_budget(&columns)
+        .saturating_add(DURATION_WIDTH)
+        .saturating_add(1)
+        .saturating_add(DURATION_WIDTH);
+    if tier == LayoutTier::Wide && width.saturating_sub(2) >= required_inner_width {
+        let index = columns
+            .iter()
+            .position(|column| column.key == RecentColumn::Latency)
+            .expect("wide recent schema must contain Latency");
+        columns.insert(
+            index,
+            ColumnSpec::fixed(RecentColumn::Ttfb, "TTFB", Alignment::Right, DURATION_WIDTH),
+        );
+    }
+    columns
+}
+
 fn http_code_cell(status: Option<u16>) -> Cell<'static> {
     Cell::from(
         Line::from(Span::styled(
@@ -1515,7 +1565,7 @@ fn render_recent(
         return;
     }
 
-    let columns = recent_columns(LayoutTier::for_outer_width(area.width));
+    let columns = recent_columns_for_width(area.width);
     let widths = column_constraints(&columns);
     let rows = recent.iter().enumerate().map(|(index, request)| {
         let cells = columns
@@ -1539,7 +1589,13 @@ fn render_recent(
                     }
                     RecentColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     RecentColumn::Endpoint => muted_cell(request.endpoint.label()),
-                    RecentColumn::Latency => number_cell(format_duration(request.latency)),
+                    RecentColumn::Ttfb => number_cell(
+                        request
+                            .ttfb
+                            .map(format_request_duration)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    RecentColumn::Latency => number_cell(format_request_duration(request.latency)),
                     RecentColumn::Rate => rate_cell(request.rate().label()),
                     RecentColumn::Input => number_cell(token_value(request.input_tokens)),
                     RecentColumn::Output => number_cell(token_value(request.output_tokens)),
@@ -1731,87 +1787,154 @@ fn render_request_detail(
     state: &MonitorState,
     selected: usize,
 ) {
-    let lines = if let Some(request) = state.recent.get(selected) {
-        let mut lines = vec![
-            detail_line("request", request.request_id.clone(), WHITE),
-            detail_line(
-                "session",
-                display_session_id(request.session_id.as_deref()),
-                TEAL,
-            ),
-            detail_line(
-                "session seq",
-                request
-                    .session_seq
-                    .map(|seq| seq.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                DIM_WHITE,
-            ),
-            detail_line("endpoint", request.endpoint.label(), DIM_WHITE),
-            detail_line("started", format_system_time(request.started_at), DIM_WHITE),
-            detail_line(
-                "finished",
-                format_system_time(request.finished_at),
-                DIM_WHITE,
-            ),
-            detail_line(
-                "status",
-                request.status.label(),
-                status_color(request.status.label()),
-            ),
-            detail_line(
-                "http status",
-                request
-                    .http_status
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                http_status_color(request.http_status),
-            ),
-            detail_line("provider", request.provider.as_deref().unwrap_or("-"), TEAL),
-            detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
-            detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
-            detail_line("latency", format_duration(request.latency), DIM_WHITE),
-            detail_line("rate", request.rate().label(), TEAL),
-            detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
-            detail_line(
-                "output tokens",
-                token_value(request.output_tokens),
-                DIM_WHITE,
-            ),
-            detail_line(
-                "stream bytes",
-                request.streamed_bytes.to_string(),
-                DIM_WHITE,
-            ),
-            detail_line(
-                "stream chunks",
-                request.stream_chunks.to_string(),
-                DIM_WHITE,
-            ),
-        ];
-        if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
-            lines.push(detail_line("detail", error, YELLOW));
-        }
-        if let Some(path) = &request.traffic_capture_path {
-            lines.push(detail_line(
-                "capture",
-                path.to_string_lossy().into_owned(),
-                DIM_WHITE,
-            ));
-        }
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "No request selected",
-            Style::default().fg(DIM),
-        ))]
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
+    let Some(request) = state.recent.get(selected) else {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                "No request selected",
+                Style::default().fg(DIM),
+            ))])
             .style(Style::default().bg(PANEL_BG))
             .block(panel("Request detail", true)),
-        area,
-    );
+            area,
+        );
+        return;
+    };
+
+    let fixed_lines = vec![
+        detail_line("request", request.request_id.clone(), WHITE),
+        detail_line(
+            "session",
+            display_session_id(request.session_id.as_deref()),
+            TEAL,
+        ),
+        detail_line(
+            "session seq",
+            request
+                .session_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            DIM_WHITE,
+        ),
+        detail_line("endpoint", request.endpoint.label(), DIM_WHITE),
+        detail_line("started", format_system_time(request.started_at), DIM_WHITE),
+        detail_line(
+            "finished",
+            format_system_time(request.finished_at),
+            DIM_WHITE,
+        ),
+        detail_line(
+            "status",
+            request.status.label(),
+            status_color(request.status.label()),
+        ),
+        detail_line(
+            "http status",
+            request
+                .http_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            http_status_color(request.http_status),
+        ),
+        detail_line("provider", request.provider.as_deref().unwrap_or("-"), TEAL),
+        detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
+        detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
+        detail_line(
+            "ttfb",
+            request
+                .ttfb
+                .map(format_request_duration)
+                .unwrap_or_else(|| "-".to_string()),
+            DIM_WHITE,
+        ),
+        detail_line(
+            "latency",
+            format_request_duration(request.latency),
+            DIM_WHITE,
+        ),
+        detail_line("rate", request.rate().label(), TEAL),
+        detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
+        detail_line(
+            "output tokens",
+            token_value(request.output_tokens),
+            DIM_WHITE,
+        ),
+        detail_line(
+            "stream bytes",
+            request.streamed_bytes.to_string(),
+            DIM_WHITE,
+        ),
+        detail_line(
+            "stream chunks",
+            request.stream_chunks.to_string(),
+            DIM_WHITE,
+        ),
+    ];
+    let mut extra_lines = Vec::new();
+    if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
+        extra_lines.push(detail_line("detail", error, YELLOW));
+    }
+    if let Some(path) = &request.traffic_capture_path {
+        extra_lines.push(detail_line(
+            "capture",
+            path.to_string_lossy().into_owned(),
+            DIM_WHITE,
+        ));
+    }
+
+    if matches!(
+        LayoutTier::for_outer_width(area.width),
+        LayoutTier::Expanded | LayoutTier::Wide
+    ) {
+        const LEFT_FIELDS: [usize; 9] = [0, 1, 2, 3, 6, 7, 8, 9, 10];
+        const RIGHT_FIELDS: [usize; 9] = [4, 5, 11, 12, 13, 14, 15, 16, 17];
+
+        let block = panel("Request detail", true);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let column_height = inner.height.min(LEFT_FIELDS.len() as u16);
+        let column_area = Rect::new(inner.x, inner.y, inner.width, column_height);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .spacing(1)
+            .split(column_area);
+        let left = LEFT_FIELDS
+            .iter()
+            .map(|&index| fixed_lines[index].clone())
+            .collect::<Vec<_>>();
+        let right = RIGHT_FIELDS
+            .iter()
+            .map(|&index| fixed_lines[index].clone())
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(left).style(Style::default().bg(PANEL_BG)),
+            columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new(right).style(Style::default().bg(PANEL_BG)),
+            columns[1],
+        );
+        if !extra_lines.is_empty() && inner.height > column_height {
+            frame.render_widget(
+                Paragraph::new(extra_lines).style(Style::default().bg(PANEL_BG)),
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(column_height),
+                    inner.width,
+                    inner.height.saturating_sub(column_height),
+                ),
+            );
+        }
+    } else {
+        let mut lines = fixed_lines;
+        lines.extend(extra_lines);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(PANEL_BG))
+                .block(panel("Request detail", true)),
+            area,
+        );
+    }
 }
 
 fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: Color) -> Line<'a> {
@@ -2056,6 +2179,14 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn format_request_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(3_600) {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else {
+        format_duration(duration)
+    }
+}
+
 fn format_system_time(time: SystemTime) -> String {
     format_system_time_in_zone(time, TimeZone::system())
 }
@@ -2158,6 +2289,19 @@ mod tests {
         let time_zone = TimeZone::fixed(jiff::tz::offset(5));
 
         assert_eq!(format_system_time_in_zone(timestamp, time_zone), "01:00:00");
+    }
+
+    #[test]
+    fn request_duration_uses_hundredths_without_widening_duration_columns() {
+        assert_eq!(
+            format_request_duration(Duration::from_millis(6_910)),
+            "6.91s"
+        );
+        assert_eq!(
+            format_request_duration(Duration::from_millis(62_340)),
+            "62.34s"
+        );
+        assert_eq!(format_request_duration(Duration::from_secs(3_600)), "1h00m");
     }
 
     #[test]
@@ -2309,8 +2453,26 @@ mod tests {
         assert!(wide.contains("Project"), "{wide}");
         assert!(wide.contains("Session"), "{wide}");
         assert!(!wide.contains("Egress"), "{wide}");
+        assert!(!wide.contains("TTFB"), "{wide}");
         assert!(wide.contains("In"), "{wide}");
         assert!(wide.contains("Out"), "{wide}");
+
+        let timed_wide = render_at(181);
+        assert!(timed_wide.contains("Egress"), "{timed_wide}");
+        assert!(timed_wide.contains("TTFB"), "{timed_wide}");
+        assert!(timed_wide.contains("Elapsed"), "{timed_wide}");
+
+        let timed_buffer = draw(181, 8, |frame| {
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
+        });
+        let (ttfb_x, header_y) = placeholder_position(&timed_buffer, "TTFB").unwrap();
+        assert_eq!(timed_buffer[(ttfb_x + 3, header_y + 3)].symbol(), "-");
     }
 
     #[test]
@@ -2362,6 +2524,10 @@ mod tests {
             Some(EGRESS_MIN_WIDTH)
         );
         assert_eq!(
+            fixed_width(&columns, ActiveColumn::Ttfb),
+            Some(DURATION_WIDTH)
+        );
+        assert_eq!(
             table_column_width(Rect::new(0, 0, 220, 1), &widths, project_index),
             usize::from(PROJECT_WIDE_WIDTH)
         );
@@ -2376,6 +2542,8 @@ mod tests {
             )
         }));
         assert!(visible.contains("Egress"), "{visible}");
+        assert!(visible.contains("TTFB"), "{visible}");
+        assert!(visible.contains("4.00s"), "{visible}");
         assert!(visible.contains("178.249.214.12"), "{visible}");
         assert!(visible.contains("claude-code-pro…"), "{visible}");
     }
@@ -2392,7 +2560,7 @@ mod tests {
         let minimum_outer_width =
             fixed_column_budget(&active_columns(LayoutTier::Wide)) + 1 + egress_width + 2;
 
-        let buffer = draw(minimum_outer_width, 8, |frame| {
+        let egress_only = draw(minimum_outer_width, 8, |frame| {
             render_active(
                 frame,
                 frame.area(),
@@ -2401,8 +2569,54 @@ mod tests {
                 0,
             )
         });
+        let egress_only = buffer_text(&egress_only);
+        assert!(egress_only.contains(address));
+        assert!(!egress_only.contains("TTFB"), "{egress_only}");
 
-        assert!(buffer_text(&buffer).contains(address));
+        let timed = draw(minimum_outer_width + DURATION_WIDTH + 1, 8, |frame| {
+            render_active(
+                frame,
+                frame.area(),
+                &state.active,
+                &state.provider_egress,
+                0,
+            )
+        });
+        assert!(buffer_text(&timed).contains("TTFB"));
+    }
+
+    #[test]
+    fn wide_recent_table_adds_ttfb_without_replacing_latency() {
+        let without_ttfb = recent_columns_for_width(162);
+        assert!(
+            without_ttfb
+                .iter()
+                .all(|column| column.key != RecentColumn::Ttfb)
+        );
+        assert!(
+            without_ttfb
+                .iter()
+                .any(|column| column.key == RecentColumn::Latency)
+        );
+
+        let with_ttfb = recent_columns_for_width(163);
+        assert_eq!(
+            fixed_width(&with_ttfb, RecentColumn::Ttfb),
+            Some(DURATION_WIDTH)
+        );
+        assert_eq!(
+            fixed_width(&with_ttfb, RecentColumn::Latency),
+            Some(DURATION_WIDTH)
+        );
+
+        let state = mock_state();
+        let rendered = buffer_text(&draw(220, 8, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, false)
+        }));
+        assert!(rendered.contains("TTFB"), "{rendered}");
+        assert!(rendered.contains("Latency"), "{rendered}");
+        assert!(rendered.contains("1.25s"), "{rendered}");
+        assert!(rendered.contains("4.82s"), "{rendered}");
     }
 
     #[test]
@@ -2450,19 +2664,21 @@ mod tests {
             assert_eq!(alignment(&sessions, key), Some(Alignment::Right));
         }
 
-        let active = active_columns(LayoutTier::Wide);
+        let active = active_columns_for_width(220, EGRESS_MIN_WIDTH);
         for key in [
             ActiveColumn::Input,
             ActiveColumn::Output,
             ActiveColumn::Rate,
+            ActiveColumn::Ttfb,
             ActiveColumn::Elapsed,
         ] {
             assert_eq!(alignment(&active, key), Some(Alignment::Right));
         }
 
-        let recent = recent_columns(LayoutTier::Wide);
+        let recent = recent_columns_for_width(220);
         for key in [
             RecentColumn::Code,
+            RecentColumn::Ttfb,
             RecentColumn::Latency,
             RecentColumn::Rate,
             RecentColumn::Input,
@@ -3013,6 +3229,38 @@ mod tests {
     }
 
     #[test]
+    fn request_detail_uses_two_columns_at_expanded_width() {
+        let state = mock_state();
+        let completed = state
+            .recent
+            .iter()
+            .position(|request| request.request_id == "req-complete-codex")
+            .unwrap();
+
+        let wide = draw(140, 13, |frame| {
+            render_request_detail(frame, frame.area(), &state, completed)
+        });
+        let wide_text = buffer_text(&wide);
+        let (wide_request_x, _) = placeholder_position(&wide, "request").unwrap();
+        let (wide_ttfb_x, _) = placeholder_position(&wide, "ttfb").unwrap();
+        let (wide_capture_x, _) = placeholder_position(&wide, "capture").unwrap();
+
+        assert!(wide_ttfb_x > wide_request_x);
+        assert_eq!(wide_capture_x, wide_request_x);
+        assert!(wide_text.contains("1.25s"), "{wide_text}");
+        assert!(wide_text.contains("4.82s"), "{wide_text}");
+        assert!(wide_text.contains("stream chunks"), "{wide_text}");
+        assert!(wide_text.contains("req-complete-codex"), "{wide_text}");
+
+        let narrow = draw(119, 22, |frame| {
+            render_request_detail(frame, frame.area(), &state, completed)
+        });
+        let (narrow_request_x, _) = placeholder_position(&narrow, "request").unwrap();
+        let (narrow_ttfb_x, _) = placeholder_position(&narrow, "ttfb").unwrap();
+        assert_eq!(narrow_ttfb_x, narrow_request_x);
+    }
+
+    #[test]
     fn recent_table_uses_error_indicator_at_medium_width() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
@@ -3071,7 +3319,7 @@ mod tests {
         monitor.request_failed("request-1", Some(502), "upstream unavailable");
         let state = monitor.snapshot();
 
-        let detail = draw(120, 20, |frame| {
+        let detail = draw(120, 21, |frame| {
             render_request_detail(frame, frame.area(), &state, 0)
         });
         let detail_text = buffer_text(&detail);
@@ -3079,6 +3327,8 @@ mod tests {
         assert!(detail_text.contains("Request detail"), "{detail_text}");
         assert!(detail_text.contains("request-1"), "{detail_text}");
         assert!(detail_text.contains("sess-1"), "{detail_text}");
+        assert!(detail_text.contains("ttfb"), "{detail_text}");
+        assert!(detail_text.contains("latency"), "{detail_text}");
         assert!(
             detail_text.contains("upstream unavailable"),
             "{detail_text}"

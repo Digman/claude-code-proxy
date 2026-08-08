@@ -99,9 +99,15 @@ impl Provider for KimiProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        let monitor = ctx.monitor.clone();
+        let request_id = ctx.req_id.clone();
         let upstream = match tokio::task::spawn_blocking(move || {
             let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
+            let result = client.post_kimi(&translated, || {
+                if let Some(monitor) = monitor.as_ref() {
+                    monitor.first_response(&request_id);
+                }
+            });
             drop(client);
             result
         })
@@ -235,9 +241,15 @@ impl Provider for KimiProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        let monitor = ctx.monitor.clone();
+        let request_id = ctx.req_id.clone();
         let upstream = tokio::task::spawn_blocking(move || {
             let client = client::KimiHttpClient::new();
-            let result = client.post_kimi(&translated);
+            let result = client.post_kimi(&translated, || {
+                if let Some(monitor) = monitor.as_ref() {
+                    monitor.first_response(&request_id);
+                }
+            });
             drop(client);
             result
         })

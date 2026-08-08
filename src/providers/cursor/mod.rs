@@ -143,7 +143,14 @@ impl Provider for CursorProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match client.run_agent(&token, &prompt, model, &images).await {
+        let upstream = match client
+            .run_agent(&token, &prompt, model, &images, || {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.first_response(&ctx.req_id);
+                }
+            })
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return map_cursor_error_to_response(&e);
@@ -305,7 +312,11 @@ impl Provider for CursorProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = CursorHttpClient::new()
-            .run_agent(&auth.access_token, &prompt, &requested, &images)
+            .run_agent(&auth.access_token, &prompt, &requested, &images, || {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.first_response(&ctx.req_id);
+                }
+            })
             .await
             .map_err(cursor_provider_error)?;
         if let Some(traffic) = ctx.traffic.as_ref() {

@@ -97,6 +97,7 @@ impl OpenCodeProvider {
                     Ok(upstream) => upstream,
                     Err(error) => return map_error(error),
                 };
+                mark_first_response(&ctx);
                 let bytes = match upstream.into_bytes().await {
                     Ok(bytes) => bytes,
                     Err(error) => return map_error(error),
@@ -120,6 +121,7 @@ impl OpenCodeProvider {
                     Ok(upstream) => upstream,
                     Err(error) => return map_error(error),
                 };
+                mark_first_response(&ctx);
                 let bytes = match upstream.into_bytes().await {
                     Ok(bytes) => bytes,
                     Err(error) => return map_error(error),
@@ -144,6 +146,7 @@ impl OpenCodeProvider {
                     Ok(upstream) => upstream,
                     Err(error) => return map_error(error),
                 };
+                mark_first_response(&ctx);
                 let bytes = match upstream.into_bytes().await {
                     Ok(bytes) => bytes,
                     Err(error) => return map_error(error),
@@ -254,6 +257,7 @@ impl Provider for OpenCodeProvider {
                     .post(spec.endpoint, &translated, true, ctx.traffic.clone())
                     .await
                     .map_err(opencode_provider_error)?;
+                mark_first_response(&ctx);
                 chat::stream_body(
                     upstream,
                     message_id,
@@ -270,6 +274,7 @@ impl Provider for OpenCodeProvider {
                     .post(spec.endpoint, &translated, true, ctx.traffic.clone())
                     .await
                     .map_err(opencode_provider_error)?;
+                mark_first_response(&ctx);
                 messages::stream_body(
                     upstream,
                     ctx.monitor.clone(),
@@ -284,6 +289,7 @@ impl Provider for OpenCodeProvider {
                     .post(spec.endpoint, &translated, true, ctx.traffic.clone())
                     .await
                     .map_err(opencode_provider_error)?;
+                mark_first_response(&ctx);
                 responses::stream_body(
                     upstream,
                     message_id,
@@ -375,6 +381,12 @@ fn invalid_upstream_response(error: impl std::fmt::Display) -> Response {
 fn mark_upstream_started(ctx: &RequestContext) {
     if let Some(monitor) = ctx.monitor.as_ref() {
         monitor.upstream_started(&ctx.req_id);
+    }
+}
+
+fn mark_first_response(ctx: &RequestContext) {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.first_response(&ctx.req_id);
     }
 }
 
@@ -676,8 +688,18 @@ mod tests {
                 "messages": [{"role":"user","content":"hello"}]
             }))
             .unwrap();
-            let response = provider.handle_messages(body, context()).await;
+            let monitor = crate::monitor::MonitorHandle::new(1);
+            monitor.request_started(
+                "req_test",
+                None,
+                None,
+                crate::monitor::EndpointKind::Messages,
+            );
+            let mut ctx = context();
+            ctx.monitor = Some(monitor.clone());
+            let response = provider.handle_messages(body, ctx).await;
             assert_eq!(response.status(), StatusCode::OK, "model {model}");
+            assert!(monitor.snapshot().active[0].ttfb.is_some());
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();

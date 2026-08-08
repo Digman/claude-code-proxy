@@ -349,6 +349,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = CursorHttpClient::new();
+    let mut first_response_count = 0;
     let upstream = client
         .run_agent(
             "wire-token",
@@ -360,10 +361,12 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
                 path: "claude-image-1.png".into(),
                 mime_type: "image/png".into(),
             }],
+            || first_response_count += 1,
         )
         .await
         .expect("mock upstream request should succeed");
     assert!(upstream.is_success());
+    assert_eq!(first_response_count, 1);
 
     let observed = observed.lock().unwrap().clone().expect("request captured");
     assert_eq!(
@@ -764,7 +767,7 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     let token = load_cursor_token().unwrap();
     let client = CursorHttpClient::new();
     let upstream = client
-        .run_agent(&token, "test prompt", "cursor:gpt-5.5", &[])
+        .run_agent(&token, "test prompt", "cursor:gpt-5.5", &[], || {})
         .await
         .expect("mock upstream request should succeed");
 

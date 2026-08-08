@@ -47,7 +47,11 @@ impl KimiHttpClient {
         &self.auth_manager
     }
 
-    pub fn post_kimi(&self, body: &KimiChatRequest) -> Result<KimiResponse, KimiError> {
+    pub fn post_kimi(
+        &self,
+        body: &KimiChatRequest,
+        mut on_first_response: impl FnMut(),
+    ) -> Result<KimiResponse, KimiError> {
         let mut auth = self.auth_manager.get_auth().map_err(|e| KimiError {
             status: 401,
             message: "Auth error".to_string(),
@@ -57,7 +61,7 @@ impl KimiHttpClient {
 
         let mut attempt = 0u32;
         loop {
-            let result = self.attempt_post(&auth.access, body);
+            let result = self.attempt_post(&auth.access, body, &mut on_first_response);
 
             match result {
                 Ok(response) if response.status == 401 && attempt == 0 => {
@@ -97,6 +101,7 @@ impl KimiHttpClient {
         &self,
         access_token: &str,
         body: &KimiChatRequest,
+        on_first_response: &mut impl FnMut(),
     ) -> Result<KimiResponse, KimiError> {
         let headers = common_headers().map_err(|e| KimiError {
             status: 500,
@@ -185,6 +190,7 @@ impl KimiHttpClient {
             });
         }
 
+        on_first_response();
         let body_bytes = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
 
         Ok(KimiResponse {

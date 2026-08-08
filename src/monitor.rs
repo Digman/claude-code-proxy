@@ -110,6 +110,9 @@ pub enum MonitorEvent {
     UpstreamStarted {
         request_id: String,
     },
+    FirstResponse {
+        request_id: String,
+    },
     GenerationStarted {
         request_id: String,
     },
@@ -169,6 +172,8 @@ pub struct ActiveRequest {
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
     started_instant: Instant,
+    /// Elapsed proxy time until the provider's first response data was observed.
+    pub ttfb: Option<Duration>,
     pub generation_started_at: Option<SystemTime>,
     generation_started_instant: Option<Instant>,
     generation_initial_output_tokens: u64,
@@ -186,6 +191,12 @@ pub struct ActiveRequest {
 impl ActiveRequest {
     pub fn elapsed(&self) -> Duration {
         self.started_instant.elapsed()
+    }
+
+    fn record_ttfb(&mut self) {
+        if self.ttfb.is_none() {
+            self.ttfb = Some(self.started_instant.elapsed());
+        }
     }
 
     pub fn rate(&self) -> Throughput {
@@ -211,6 +222,8 @@ pub struct CompletedRequest {
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
     pub finished_at: SystemTime,
+    /// Elapsed proxy time until the provider's first response data was observed.
+    pub ttfb: Option<Duration>,
     pub generation_started_at: Option<SystemTime>,
     generation_started_instant: Option<Instant>,
     generation_initial_output_tokens: u64,
@@ -464,10 +477,17 @@ impl MonitorHandle {
         });
     }
 
-    pub fn generation_started(&self, request_id: impl Into<String>) {
-        self.publish(MonitorEvent::GenerationStarted {
+    /// Records the first successful upstream response without changing generation timing.
+    pub fn first_response(&self, request_id: impl Into<String>) {
+        self.publish(MonitorEvent::FirstResponse {
             request_id: request_id.into(),
         });
+    }
+
+    pub fn generation_started(&self, request_id: impl Into<String>) {
+        let request_id = request_id.into();
+        self.first_response(request_id.clone());
+        self.publish(MonitorEvent::GenerationStarted { request_id });
     }
 
     pub fn traffic_capture_path(&self, request_id: impl Into<String>, path: PathBuf) {
@@ -591,6 +611,7 @@ impl MonitorStore {
                         endpoint,
                         started_at: SystemTime::now(),
                         started_instant: Instant::now(),
+                        ttfb: None,
                         generation_started_at: None,
                         generation_started_instant: None,
                         generation_initial_output_tokens: 0,
@@ -654,6 +675,11 @@ impl MonitorStore {
                     active.status = RequestStatus::Upstream;
                 }
             }
+            MonitorEvent::FirstResponse { request_id } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.record_ttfb();
+                }
+            }
             MonitorEvent::GenerationStarted { request_id } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.generation_started_at = Some(SystemTime::now());
@@ -680,6 +706,7 @@ impl MonitorStore {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Streaming;
                     if active.generation_started_instant.is_none() {
+                        active.record_ttfb();
                         active.generation_started_at = Some(SystemTime::now());
                         active.generation_started_instant = Some(Instant::now());
                         active.generation_initial_output_tokens =
@@ -907,6 +934,7 @@ impl MonitorStore {
                 endpoint: EndpointKind::Messages,
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
+                ttfb: None,
                 generation_started_at: None,
                 generation_started_instant: None,
                 generation_initial_output_tokens: 0,
@@ -940,6 +968,7 @@ impl MonitorStore {
             endpoint: active.endpoint,
             started_at: active.started_at,
             finished_at: SystemTime::now(),
+            ttfb: active.ttfb,
             generation_started_at: active.generation_started_at,
             generation_started_instant: active.generation_started_instant,
             generation_initial_output_tokens: active.generation_initial_output_tokens,
@@ -1364,7 +1393,35 @@ mod tests {
 
         let state = monitor.snapshot();
         assert_eq!(state.active.len(), 1);
+        assert!(state.active[0].ttfb.is_some());
         assert_eq!(state.active[0].rate(), Throughput::None);
+    }
+
+    #[test]
+    fn first_response_records_ttfb_without_starting_generation() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.first_response("r1");
+
+        let state = monitor.snapshot();
+        assert!(state.active[0].ttfb.is_some());
+        assert!(state.active[0].generation_started_at.is_none());
+        assert!(state.active[0].generation_duration.is_none());
+    }
+
+    #[test]
+    fn generation_started_records_ttfb_once_and_preserves_it_on_completion() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.generation_started("r1");
+        let first = monitor.snapshot().active[0].ttfb.unwrap();
+
+        std::thread::sleep(Duration::from_millis(1));
+        monitor.generation_started("r1");
+        assert_eq!(monitor.snapshot().active[0].ttfb, Some(first));
+
+        monitor.request_completed("r1", 200, None, None);
+        assert_eq!(monitor.snapshot().recent[0].ttfb, Some(first));
     }
 
     #[test]
@@ -1513,6 +1570,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             endpoint: EndpointKind::Messages,
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: SystemTime::UNIX_EPOCH + latency,
+            ttfb: None,
             generation_started_at: generation_duration.map(|_| SystemTime::UNIX_EPOCH),
             generation_started_instant: None,
             generation_initial_output_tokens: 0,

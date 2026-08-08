@@ -71,6 +71,7 @@ impl CursorHttpClient {
         prompt: &str,
         model: &str,
         images: &[CursorSelectedImage],
+        mut on_first_response: impl FnMut(),
     ) -> Result<CursorUpstreamResponse, CursorError> {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
@@ -138,6 +139,9 @@ impl CursorHttpClient {
             .get("grpc-message")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        if (200..300).contains(&status) {
+            on_first_response();
+        }
         let mut stream = response.bytes_stream();
         let mut body_bytes = Vec::new();
         let mut received_data = false;

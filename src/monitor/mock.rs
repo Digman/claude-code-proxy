@@ -87,6 +87,7 @@ fn mock_state_for_tick(
     streaming.effort = Some("high".to_string());
     streaming.generation_started_at = Some(now - Duration::from_secs(10));
     streaming.generation_started_instant = Some(instant_now - Duration::from_secs(10));
+    streaming.ttfb = Some(Duration::from_secs(4));
     streaming.generation_initial_output_tokens = 20;
     streaming.generation_finished_at = Some(now - Duration::from_secs(2));
     streaming.generation_duration = Some(Duration::from_secs(8));
@@ -170,6 +171,7 @@ fn mock_state_for_tick(
     byte_stream.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
     byte_stream.generation_started_at = Some(now - Duration::from_secs(20));
     byte_stream.generation_started_instant = Some(instant_now - Duration::from_secs(20));
+    byte_stream.ttfb = Some(Duration::from_secs(2));
     byte_stream.generation_finished_at = Some(now - Duration::from_secs(4));
     byte_stream.streamed_bytes = 32_768_u64.saturating_add(tick.saturating_mul(640));
     byte_stream.stream_chunks = 128_u64.saturating_add(tick.saturating_mul(4));
@@ -189,6 +191,7 @@ fn mock_state_for_tick(
         RequestStatus::Completed,
         Some(200),
     );
+    success.ttfb = Some(Duration::from_millis(1_250));
     success.project = Some("claude-code-proxy".to_string());
     success.provider = Some("codex".to_string());
     success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
@@ -583,6 +586,7 @@ fn simulated_active_request(
             .saturating_add(generation_ticks.saturating_mul(generation_ticks) / 3);
         request.generation_started_at = Some(now - generation_duration);
         request.generation_started_instant = Some(instant_now - generation_duration);
+        request.ttfb = Some(Duration::from_millis(9 * TICK_MILLIS));
         request.generation_finished_at = Some(now);
         request.generation_duration = Some(generation_duration);
         request.streamed_bytes = output_tokens.saturating_mul(24);
@@ -695,6 +699,7 @@ fn active_request(
         endpoint,
         started_at: now - elapsed,
         started_instant: instant_now - elapsed,
+        ttfb: None,
         generation_started_at: None,
         generation_started_instant: None,
         generation_initial_output_tokens: 0,
@@ -734,6 +739,7 @@ fn completed_request(
         endpoint,
         started_at: finished_at - latency,
         finished_at,
+        ttfb: None,
         generation_started_at: None,
         generation_started_instant: None,
         generation_initial_output_tokens: 0,
@@ -792,6 +798,15 @@ mod tests {
                 .recent
                 .iter()
                 .any(|request| request.endpoint == EndpointKind::CountTokens)
+        );
+        assert!(
+            state
+                .recent
+                .iter()
+                .find(|request| request.endpoint == EndpointKind::CountTokens)
+                .unwrap()
+                .ttfb
+                .is_none()
         );
         assert!(
             state
