@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::providers::codex::events::{classify_event_failure, first_retryable_failure};
 
 use super::ChatError;
 
@@ -46,8 +47,8 @@ impl CompletionState {
 
     pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
         let kind = event.get("type").and_then(Value::as_str);
-        if matches!(kind, Some("response.failed" | "response.error" | "error")) {
-            return Err(event_error(event));
+        if let Some(failure) = classify_event_failure(event) {
+            return Err(ChatError::from_event_failure(failure));
         }
         match kind {
             Some("response.created" | "response.in_progress") => {
@@ -62,18 +63,13 @@ impl CompletionState {
                 self.text.push_str(delta);
                 return Ok(Some(delta.to_string()));
             }
-            Some("response.completed" | "response.incomplete") => {
+            Some("response.completed" | "response.done") => {
                 let response = event.get("response").ok_or_else(|| {
                     ChatError::upstream("Codex completion event did not contain a response")
                 })?;
                 self.update_metadata(response);
                 if response.get("status").and_then(Value::as_str) == Some("failed") {
                     return Err(event_error(event));
-                }
-                if kind == Some("response.incomplete")
-                    || response.get("status").and_then(Value::as_str) == Some("incomplete")
-                {
-                    self.finish_reason = "length";
                 }
                 self.completed = true;
             }
@@ -132,6 +128,9 @@ pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatEr
         state.observe(&value)?;
     }
     if !state.completed {
+        if let Some(failure) = first_retryable_failure(body) {
+            return Err(ChatError::from_event_failure(failure));
+        }
         return Err(ChatError::upstream(
             "Codex event stream ended before completion",
         ));
@@ -188,6 +187,7 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::StatusCode;
 
     #[test]
     fn aggregates_ordered_deltas_and_usage() {
@@ -199,10 +199,37 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_maps_to_length() {
+    fn incomplete_is_an_upstream_error() {
         let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n";
-        let value = aggregate_sse(body, "model").unwrap();
-        assert_eq!(value["choices"][0]["finish_reason"], "length");
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert!(error.message.contains("Incomplete response"));
+    }
+
+    #[test]
+    fn buffered_chat_preserves_typed_terminal_failure() {
+        let body = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"input exceeds context window\"}}}\n\n";
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.kind, "request_too_large");
+        assert_eq!(error.message, "input exceeds context window");
+    }
+
+    #[test]
+    fn buffered_chat_preserves_event_retry_after() {
+        let body = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":429,\"message\":\"rate limited\",\"retry_after\":\"7\"}}}\n\n";
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.kind, "rate_limit_error");
+        assert_eq!(error.retry_after.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn buffered_chat_uses_quota_hint_when_stream_ends_without_terminal() {
+        let body = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":11}},\"credits\":{\"has_credits\":false,\"unlimited\":false}}\n\n";
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.kind, "rate_limit_error");
+        assert_eq!(error.retry_after.as_deref(), Some("11"));
     }
 
     #[test]

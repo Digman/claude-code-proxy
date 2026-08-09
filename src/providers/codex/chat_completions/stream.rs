@@ -6,7 +6,10 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
-use crate::providers::codex::native::NativeResponseOutcome;
+use crate::providers::codex::{
+    events::{CodexEventFailure, quota_failure_hint},
+    native::NativeResponseOutcome,
+};
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
 use super::{ChatError, response::CompletionState};
@@ -26,6 +29,7 @@ pub fn streaming_response(
         pending: Vec::new(),
         output: VecDeque::new(),
         completion: CompletionState::new(&model),
+        quota_failure_hint: None,
         role_sent: false,
         include_usage,
         ended: false,
@@ -78,13 +82,13 @@ async fn next_frame(
         {
             Ok(Some(Ok(chunk))) => state.observe_chunk(&chunk),
             Ok(Some(Err(error))) => {
-                state.fail(ChatError::upstream(format!(
+                state.fail_after_stream_end(ChatError::upstream(format!(
                     "Codex response body read failed: {error}"
                 )));
             }
             Ok(None) => {
                 if !state.completion.completed {
-                    state.fail(ChatError::upstream(
+                    state.fail_after_stream_end(ChatError::upstream(
                         "Codex event stream ended before completion",
                     ));
                 } else {
@@ -92,7 +96,7 @@ async fn next_frame(
                 }
             }
             Err(_) => {
-                state.fail(ChatError::timeout(format!(
+                state.fail_after_stream_end(ChatError::timeout(format!(
                     "Timed out waiting {}ms for the next Codex response body chunk",
                     state.body_idle_timeout_ms
                 )));
@@ -106,6 +110,7 @@ struct StreamState {
     pending: Vec<u8>,
     output: VecDeque<Bytes>,
     completion: CompletionState,
+    quota_failure_hint: Option<CodexEventFailure>,
     role_sent: bool,
     include_usage: bool,
     ended: bool,
@@ -178,6 +183,9 @@ impl StreamState {
             traffic.write_json_event("040-upstream-event", &event);
         }
         super::super::events::record_rate_limit_snapshot(self.ctx.monitor.as_ref(), &event);
+        if event.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+            self.quota_failure_hint = quota_failure_hint(&event);
+        }
         match self.completion.observe(&event) {
             Ok(Some(delta)) => {
                 if !self.role_sent {
@@ -233,6 +241,15 @@ impl StreamState {
         self.output
             .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
         self.ended = true;
+    }
+
+    fn fail_after_stream_end(&mut self, fallback: ChatError) {
+        let error = self
+            .quota_failure_hint
+            .take()
+            .map(ChatError::from_event_failure)
+            .unwrap_or(fallback);
+        self.fail(error);
     }
 
     fn fail(&mut self, error: ChatError) {

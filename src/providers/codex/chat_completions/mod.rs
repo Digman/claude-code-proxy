@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 
 use crate::provider::RequestContext;
 
-use super::client::{CodexError, CodexHttpClient};
+use super::{
+    client::{CodexError, CodexHttpClient},
+    events::{CodexEventFailure, first_retryable_failure},
+};
 use request::TranslatedRequest;
 
 pub struct ChatCompletionsBackend {
@@ -131,32 +134,29 @@ async fn collect_body(
                 }
             }
             Ok(Some(Err(error))) => {
-                return Err(ChatError::upstream(format!(
-                    "Codex response body read failed: {error}"
-                )));
+                let fallback =
+                    ChatError::upstream(format!("Codex response body read failed: {error}"));
+                return Err(quota_or_body_error(&bytes, fallback));
             }
             Ok(None) => return Ok(bytes),
             Err(_) => {
-                return Err(ChatError::timeout(format!(
+                let fallback = ChatError::timeout(format!(
                     "Timed out waiting {idle_timeout_ms}ms for the next Codex response body chunk"
-                )));
+                ));
+                return Err(quota_or_body_error(&bytes, fallback));
             }
         }
     }
 }
 
+fn quota_or_body_error(bytes: &[u8], fallback: ChatError) -> ChatError {
+    first_retryable_failure(bytes)
+        .map(ChatError::from_event_failure)
+        .unwrap_or(fallback)
+}
+
 fn codex_error_response(error: CodexError) -> Response {
-    let retry_after = error.retry_after.clone();
-    let response = ChatError::from_codex(error).response();
-    if let Some(retry_after) = retry_after
-        && let Ok(value) = http::HeaderValue::from_str(&retry_after)
-    {
-        let (mut parts, body) = response.into_parts();
-        parts.headers.insert(http::header::RETRY_AFTER, value);
-        Response::from_parts(parts, body)
-    } else {
-        response
-    }
+    ChatError::from_codex(error).response()
 }
 
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
@@ -201,6 +201,8 @@ pub struct ChatError {
     pub message: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    /// Value copied to `Retry-After` on buffered error responses.
+    pub retry_after: Option<String>,
 }
 
 impl ChatError {
@@ -217,7 +219,13 @@ impl ChatError {
             message: message.into(),
             param: param.map(str::to_string),
             code: code.map(str::to_string),
+            retry_after: None,
         }
+    }
+
+    pub fn with_retry_after(mut self, retry_after: Option<String>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     pub fn invalid(message: impl Into<String>, param: Option<&str>, code: Option<&str>) -> Self {
@@ -253,6 +261,14 @@ impl ChatError {
         )
     }
 
+    pub(crate) fn from_event_failure(failure: CodexEventFailure) -> Self {
+        let status =
+            StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let kind = failure.client_error_type();
+        let retry_after = failure.retry_after;
+        Self::new(status, kind, failure.message, None, None).with_retry_after(retry_after)
+    }
+
     fn from_codex(error: CodexError) -> Self {
         let status = match error.status {
             401 => StatusCode::UNAUTHORIZED,
@@ -267,6 +283,7 @@ impl ChatError {
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             _ => "api_error",
         };
+        let retry_after = error.retry_after;
         Self::new(
             status,
             kind,
@@ -274,6 +291,7 @@ impl ChatError {
             None,
             None,
         )
+        .with_retry_after(retry_after)
     }
 
     pub fn value(&self) -> Value {
@@ -281,7 +299,16 @@ impl ChatError {
     }
 
     pub fn response(self) -> Response {
-        (self.status, Json(self.value())).into_response()
+        let retry_after = self.retry_after.clone();
+        let mut response = (self.status, Json(self.value())).into_response();
+        if let Some(retry_after) = retry_after
+            && let Ok(value) = http::HeaderValue::from_str(&retry_after)
+        {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -414,6 +441,84 @@ mod tests {
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.active[0].input_tokens, Some(8));
         assert_eq!(snapshot.active[0].output_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn buffered_event_failure_preserves_retry_after_header() {
+        const SSE: &[u8] = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":429,\"message\":\"rate limited\",\"retry_after\":\"7\"}}}\n\n";
+        let (backend, server) = mock_backend(SSE).await;
+        let request = request::translate_request(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let response = backend
+            .handle(request, context(MonitorHandle::new(10)))
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "7");
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["message"], "rate limited");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_quota_snapshot_then_eof_returns_rate_limit() {
+        const SSE: &[u8] = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":11}},\"credits\":{\"has_credits\":false,\"unlimited\":false}}\n\n";
+        let (backend, server) = mock_backend(SSE).await;
+        let request = request::translate_request(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let response = backend
+            .handle(request, context(MonitorHandle::new(10)))
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "11");
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_quota_snapshot_then_eof_emits_rate_limit_error() {
+        const SSE: &[u8] = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":11}},\"credits\":{\"has_credits\":false,\"unlimited\":false}}\n\n";
+        let (backend, server) = mock_backend(SSE).await;
+        let request = request::translate_request(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":true
+        }))
+        .unwrap();
+
+        let response = backend
+            .handle(request, context(MonitorHandle::new(10)))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(r#""type":"rate_limit_error""#));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

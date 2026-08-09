@@ -1326,6 +1326,7 @@ impl CodexHttpClient {
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
                 let mut pending_events = Vec::new();
+                let mut quota_failure_hint = None;
 
                 let mut retry_error = 'read_attempt: loop {
                     let chunk = tokio::select! {
@@ -1351,12 +1352,15 @@ impl CodexHttpClient {
                     let chunk = match chunk {
                         Ok(Ok(Some(chunk))) => chunk,
                         Ok(Ok(None)) => {
-                            let error = match decoder.finish() {
-                                Ok(()) => http_sse_error(
-                                    "Codex SSE stream ended before a terminal response event",
-                                ),
-                                Err(error) => error,
-                            };
+                            let error = quota_or_stream_error(
+                                quota_failure_hint.as_ref(),
+                                match decoder.finish() {
+                                    Ok(()) => http_sse_error(
+                                        "Codex SSE stream ended before a terminal response event",
+                                    ),
+                                    Err(error) => error,
+                                },
+                            );
                             log_http_stream_end(
                                 &log,
                                 "codex_http_stream_failed",
@@ -1374,15 +1378,18 @@ impl CodexHttpClient {
                             return;
                         }
                         Ok(Err(err)) => {
-                            let error = CodexError {
-                                status: 0,
-                                message: format!(
-                                    "Transport error reading Codex response body: {err}"
-                                ),
-                                detail: Some("http_response_body".to_string()),
-                                retry_after: None,
-                                origin: CodexErrorOrigin::Http,
-                            };
+                            let error = quota_or_stream_error(
+                                quota_failure_hint.as_ref(),
+                                CodexError {
+                                    status: 0,
+                                    message: format!(
+                                        "Transport error reading Codex response body: {err}"
+                                    ),
+                                    detail: Some("http_response_body".to_string()),
+                                    retry_after: None,
+                                    origin: CodexErrorOrigin::Http,
+                                },
+                            );
                             log_http_stream_end(
                                 &log,
                                 "codex_http_stream_failed",
@@ -1400,15 +1407,18 @@ impl CodexHttpClient {
                             return;
                         }
                         Err(_) => {
-                            let error = CodexError {
-                                status: 0,
-                                message: format!(
-                                    "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
-                                ),
-                                detail: Some("http_response_body".to_string()),
-                                retry_after: None,
-                                origin: CodexErrorOrigin::Http,
-                            };
+                            let error = quota_or_stream_error(
+                                quota_failure_hint.as_ref(),
+                                CodexError {
+                                    status: 0,
+                                    message: format!(
+                                        "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
+                                    ),
+                                    detail: Some("http_response_body".to_string()),
+                                    retry_after: None,
+                                    origin: CodexErrorOrigin::Http,
+                                },
+                            );
                             log_http_stream_end(
                                 &log,
                                 "codex_http_stream_failed",
@@ -1464,6 +1474,12 @@ impl CodexHttpClient {
                         }
 
                         super::events::record_rate_limit_snapshot(ctx.monitor.as_ref(), &payload);
+                        if payload.get("type").and_then(serde_json::Value::as_str)
+                            == Some("codex.rate_limits")
+                        {
+                            quota_failure_hint = super::events::quota_failure_hint(&payload);
+                        }
+                        let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
                             && let Some(failure) = failure.as_ref()
@@ -1473,30 +1489,53 @@ impl CodexHttpClient {
                             break 'read_attempt codex_event_failure_error(failure.clone());
                         }
 
-                        let terminal = event_closes_http_stream(&payload);
-                        if !semantic_output_forwarded && failure.is_some() {
-                            pending_events.clear();
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
-                            }
-                        } else if !semantic_output_forwarded
-                            && http_event_starts_semantic_output(&payload)
-                        {
-                            semantic_output_forwarded = true;
-                            for pending in pending_events.drain(..) {
-                                if tx.send(Ok(pending)).await.is_err() {
+                        let terminal = super::events::event_is_terminal(&payload);
+                        match event_kind {
+                            super::events::CodexStreamEventKind::TerminalFailure => {
+                                if !semantic_output_forwarded {
+                                    pending_events.clear();
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
                                     return;
                                 }
                             }
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
+                            super::events::CodexStreamEventKind::TerminalSuccess => {
+                                for pending in pending_events.drain(..) {
+                                    if tx.send(Ok(pending)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else if semantic_output_forwarded || http_event_is_control(&payload) {
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
+                            super::events::CodexStreamEventKind::Semantic => {
+                                if !semantic_output_forwarded {
+                                    semantic_output_forwarded = true;
+                                    for pending in pending_events.drain(..) {
+                                        if tx.send(Ok(pending)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else {
-                            pending_events.push(payload);
+                            super::events::CodexStreamEventKind::Control => {
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            super::events::CodexStreamEventKind::Structural => {
+                                if semantic_output_forwarded {
+                                    if tx.send(Ok(payload)).await.is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    pending_events.push(payload);
+                                }
+                            }
                         }
 
                         if terminal {
@@ -2090,6 +2129,7 @@ impl CodexHttpClient {
                 }
             };
 
+            let mut pending_events = Vec::new();
             loop {
                 let item = tokio::select! {
                     biased;
@@ -2186,20 +2226,71 @@ impl CodexHttpClient {
                     continue 'attempt;
                 }
 
-                if item.as_ref().is_ok_and(event_closes_live_retry_window) {
-                    forwarded_any = true;
-                }
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
-                if tx.send(item).await.is_err() {
-                    if let Some(reservation) = continuation.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_socket(
-                            reservation,
-                            stream.socket_id(),
-                        );
+                match item {
+                    Ok(payload) => match super::events::classify_stream_event(&payload) {
+                        super::events::CodexStreamEventKind::TerminalFailure => {
+                            if !forwarded_any {
+                                pending_events.clear();
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::TerminalSuccess => {
+                            for pending in pending_events.drain(..) {
+                                if tx.send(Ok(pending)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Semantic => {
+                            if !forwarded_any {
+                                forwarded_any = true;
+                                for pending in pending_events.drain(..) {
+                                    if tx.send(Ok(pending)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Control => {
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Structural => {
+                            if forwarded_any {
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
+                            } else {
+                                pending_events.push(payload);
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        if tx.send(Err(err)).await.is_err() {
+                            if let Some(reservation) = continuation.as_ref() {
+                                super::websocket::invalidate_codex_websocket_pool_socket(
+                                    reservation,
+                                    stream.socket_id(),
+                                );
+                            }
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                            return;
+                        }
                     }
-                    abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
-                    return;
                 }
                 if terminal {
                     return;
@@ -2470,62 +2561,6 @@ fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
         .collect()
 }
 
-fn event_closes_http_stream(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some(
-            "response.completed"
-                | "response.incomplete"
-                | "response.done"
-                | "response.failed"
-                | "response.error"
-                | "error"
-        )
-    )
-}
-
-fn http_event_is_control(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some(
-            "keepalive"
-                | "response.created"
-                | "response.in_progress"
-                | "codex.rate_limits"
-                | "response.web_search_call.in_progress"
-                | "response.web_search_call.searching"
-                | "response.web_search_call.completed"
-        )
-    )
-}
-
-fn http_event_starts_semantic_output(payload: &serde_json::Value) -> bool {
-    match payload.get("type").and_then(|value| value.as_str()) {
-        Some("response.output_item.added") => matches!(
-            payload
-                .pointer("/item/type")
-                .and_then(|value| value.as_str()),
-            Some("message" | "function_call")
-        ),
-        Some(
-            "response.reasoning_summary_text.delta"
-            | "response.output_text.delta"
-            | "response.function_call_arguments.delta",
-        ) => payload
-            .get("delta")
-            .and_then(|value| value.as_str())
-            .is_some_and(|delta| !delta.is_empty()),
-        Some("response.output_item.done") => matches!(
-            payload
-                .pointer("/item/type")
-                .and_then(|value| value.as_str()),
-            Some("reasoning" | "message" | "function_call")
-        ),
-        Some("response.completed" | "response.incomplete" | "response.done") => true,
-        _ => false,
-    }
-}
-
 fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> CodexError {
     CodexError {
         status: failure.status,
@@ -2534,6 +2569,16 @@ fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> Codex
         retry_after: failure.retry_after,
         origin: CodexErrorOrigin::Http,
     }
+}
+
+fn quota_or_stream_error(
+    quota_hint: Option<&super::events::CodexEventFailure>,
+    error: CodexError,
+) -> CodexError {
+    quota_hint
+        .cloned()
+        .map(codex_event_failure_error)
+        .unwrap_or(error)
 }
 
 fn retryable_http_stream_error(error: &CodexError) -> bool {
@@ -2960,11 +3005,9 @@ fn invalidate_live_continuation_pool(
     super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, continuation.turn_id());
 }
 
+#[cfg(test)]
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
-    !matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "keepalive")
-    )
+    super::events::classify_stream_event(payload) == super::events::CodexStreamEventKind::Semantic
 }
 
 pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
@@ -3422,7 +3465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_stream_forwards_event_before_terminal_body() {
+    async fn http_stream_buffers_structural_event_until_terminal_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -3461,17 +3504,19 @@ mod tests {
             synthetic.get("type").and_then(|value| value.as_str()),
             Some("keepalive")
         );
-        let first_upstream = tokio::time::timeout(Duration::from_millis(200), events.recv())
-            .await
-            .expect("first upstream event must arrive before the response completes")
-            .unwrap()
-            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "structural event must remain buffered before semantic output or terminal success"
+        );
+
+        release_tx.send(()).unwrap();
+        let first_upstream = events.recv().await.unwrap().unwrap();
         assert_eq!(
             first_upstream.get("type").and_then(|value| value.as_str()),
             Some("response.output_item.added")
         );
-
-        release_tx.send(()).unwrap();
         let terminal = events.recv().await.unwrap().unwrap();
         assert_eq!(
             terminal.get("type").and_then(|value| value.as_str()),
@@ -5215,7 +5260,7 @@ mod tests {
     }
 
     #[test]
-    fn informational_events_keep_live_continuation_retry_available() {
+    fn informational_and_structural_events_keep_live_continuation_retry_available() {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "codex.rate_limits",
             "rate_limits": {"limit_reached": false}
@@ -5223,8 +5268,16 @@ mod tests {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "keepalive"
         })));
-        assert!(event_closes_live_retry_window(&serde_json::json!({
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call"}
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hello"
         })));
     }
 

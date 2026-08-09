@@ -54,14 +54,6 @@ const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
 const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
 
-// Terminal WebSocket event types that signal the request is done
-const TERMINAL_EVENTS: &[&str] = &[
-    "response.completed",
-    "response.incomplete",
-    "response.failed",
-    "error",
-];
-
 pub type CodexWebSocketEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
@@ -684,10 +676,7 @@ fn encode_sse(text: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub(super) fn is_terminal_event(payload: &serde_json::Value) -> bool {
-    match payload.get("type").and_then(|v| v.as_str()) {
-        Some(t) => TERMINAL_EVENTS.contains(&t),
-        None => false,
-    }
+    super::events::event_is_terminal(payload)
 }
 
 fn is_response_event(payload: &serde_json::Value) -> bool {
@@ -1169,6 +1158,22 @@ fn missing_terminal_error() -> CodexError {
         message: "WebSocket connection closed before terminal Codex response event".to_string(),
         detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
+fn quota_or_websocket_error(
+    quota_hint: Option<&super::events::CodexEventFailure>,
+    error: CodexError,
+) -> CodexError {
+    let Some(failure) = quota_hint else {
+        return error;
+    };
+    CodexError {
+        status: failure.status,
+        message: failure.message.clone(),
+        detail: Some(failure.message.clone()),
+        retry_after: failure.retry_after.clone(),
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1966,6 +1971,7 @@ where
     let response_wait_started = Instant::now();
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
+    let mut quota_failure_hint = None;
 
     loop {
         let response_deadline_started = if response_started {
@@ -1978,13 +1984,16 @@ where
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
                     invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    });
+                    return Err(quota_or_websocket_error(
+                        quota_failure_hint.as_ref(),
+                        CodexError {
+                            status: 0,
+                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                            detail: None,
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        },
+                    ));
                 }
             }
         } else {
@@ -1992,7 +2001,10 @@ where
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
                     invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(response_start_timeout_error(idle_timeout_ms));
+                    return Err(quota_or_websocket_error(
+                        quota_failure_hint.as_ref(),
+                        response_start_timeout_error(idle_timeout_ms),
+                    ));
                 }
             }
         };
@@ -2001,17 +2013,20 @@ where
 
         let frame = timeout.await.map_err(|_| {
             invalidate_pool_owner(pool_owner, pool_entry);
-            if response_started {
-                CodexError {
-                    status: 0,
-                    message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                    detail: None,
-                    retry_after: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                }
-            } else {
-                response_start_timeout_error(idle_timeout_ms)
-            }
+            quota_or_websocket_error(
+                quota_failure_hint.as_ref(),
+                if response_started {
+                    CodexError {
+                        status: 0,
+                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }
+                } else {
+                    response_start_timeout_error(idle_timeout_ms)
+                },
+            )
         })?;
 
         match frame {
@@ -2041,6 +2056,11 @@ where
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
 
+                if parsed.get("type").and_then(serde_json::Value::as_str)
+                    == Some("codex.rate_limits")
+                {
+                    quota_failure_hint = super::events::quota_failure_hint(&parsed);
+                }
                 if is_response_event(&parsed) {
                     response_started = true;
                     last_response_event_at = Instant::now();
@@ -2090,13 +2110,16 @@ where
             Some(Err(e)) => {
                 // Stream error - invalidate pool
                 invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket stream error: {e}"),
-                    detail: None,
-                    retry_after: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
+                return Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    CodexError {
+                        status: 0,
+                        message: format!("WebSocket stream error: {e}"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    },
+                ));
             }
             None => {
                 // Stream ended - invalidate pool
@@ -2106,6 +2129,14 @@ where
         }
     }
 
+    if terminal_event.is_none()
+        && let Some(failure) = quota_failure_hint.as_ref()
+    {
+        return Err(quota_or_websocket_error(
+            Some(failure),
+            missing_terminal_error(),
+        ));
+    }
     Ok((sse_body, terminal_event))
 }
 
@@ -2127,6 +2158,7 @@ where
     let mut status = 200u16;
     let mut reusable = false;
     let mut terminal_item = None;
+    let mut quota_failure_hint = None;
 
     loop {
         let response_deadline_started = if response_started {
@@ -2134,11 +2166,14 @@ where
         } else {
             response_wait_started
         };
-        let read_timeout =
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    terminal_item = Some(Err(if response_started {
+        let read_timeout = match response_event_budget
+            .checked_sub(response_deadline_started.elapsed())
+        {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                terminal_item = Some(Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    if response_started {
                         CodexError {
                             status: 0,
                             message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
@@ -2148,10 +2183,11 @@ where
                         }
                     } else {
                         response_start_timeout_error(idle_timeout_ms)
-                    }));
-                    break;
-                }
-            };
+                    },
+                )));
+                break;
+            }
+        };
 
         let frame = tokio::select! {
             biased;
@@ -2159,17 +2195,22 @@ where
             frame = tokio::time::timeout(read_timeout, ws.next()) => match frame {
                 Ok(frame) => frame,
                 Err(_) => {
-                    terminal_item = Some(Err(if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    }));
+                    terminal_item = Some(Err(quota_or_websocket_error(
+                        quota_failure_hint.as_ref(),
+                        if response_started {
+                            CodexError {
+                                status: 0,
+                                message: format!(
+                                    "WebSocket idle timeout after {idle_timeout_ms}ms"
+                                ),
+                                detail: None,
+                                retry_after: None,
+                                origin: CodexErrorOrigin::WebSocket,
+                            }
+                        } else {
+                            response_start_timeout_error(idle_timeout_ms)
+                        },
+                    )));
                     break;
                 }
             },
@@ -2199,6 +2240,11 @@ where
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
 
+                if parsed.get("type").and_then(serde_json::Value::as_str)
+                    == Some("codex.rate_limits")
+                {
+                    quota_failure_hint = super::events::quota_failure_hint(&parsed);
+                }
                 if is_response_event(&parsed) {
                     response_started = true;
                     last_response_event_at = Instant::now();
@@ -2243,22 +2289,33 @@ where
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
             Some(Ok(Message::Close(_))) | None => {
-                terminal_item = Some(Err(missing_terminal_error()));
+                terminal_item = Some(Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    missing_terminal_error(),
+                )));
                 break;
             }
             Some(Err(error)) => {
-                terminal_item = Some(Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket stream error: {error}"),
-                    detail: None,
-                    retry_after: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                }));
+                terminal_item = Some(Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    CodexError {
+                        status: 0,
+                        message: format!("WebSocket stream error: {error}"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    },
+                )));
                 break;
             }
         }
     }
 
+    if let Some(Err(error)) = terminal_item.as_ref()
+        && error.status != 0
+    {
+        status = error.status;
+    }
     if let Some(tc) = traffic.as_deref() {
         write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
     }
