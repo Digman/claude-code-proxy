@@ -1324,6 +1324,7 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
     is_websocket_response_timeout(err)
+        || websocket::is_stream_transport_error(err)
         || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
@@ -2274,6 +2275,26 @@ mod tests {
         };
 
         assert!(!is_websocket_response_timeout(&err));
+        assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn live_start_websocket_transport_errors_use_structured_retry_classification() {
+        let message = concat!(
+            "WebSocket stream error: IO error: peer closed connection without sending TLS ",
+            "close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/",
+            "index.html#unexpected-eof"
+        );
+        let mut err = client::CodexError {
+            status: 0,
+            message: message.to_string(),
+            detail: Some(websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(retryable_live_start_codex_error(&err));
+        err.origin = client::CodexErrorOrigin::Http;
         assert!(!retryable_live_start_codex_error(&err));
     }
 

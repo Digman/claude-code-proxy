@@ -15,7 +15,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
-        Message,
+        Error as WebSocketError, Message,
         client::IntoClientRequest,
         handshake::{client::generate_key, derive_accept_key},
         protocol::Role,
@@ -45,6 +45,7 @@ pub const WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL: &str = "websocket_response_idl
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
 pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
+pub(super) const WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL: &str = "websocket_stream_transport_error";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
@@ -1201,6 +1202,23 @@ pub(super) fn is_response_timeout_error(error: &CodexError) -> bool {
         )
 }
 
+pub(super) fn is_stream_transport_error(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocket
+        && error.detail.as_deref() == Some(WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL)
+}
+
+fn websocket_stream_error(error: WebSocketError) -> CodexError {
+    let detail = matches!(&error, WebSocketError::Io(_) | WebSocketError::Tls(_))
+        .then(|| WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL.to_string());
+    CodexError {
+        status: 0,
+        message: format!("WebSocket stream error: {error}"),
+        detail,
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn response_timeout_error(response_started: bool, timeout_ms: u64) -> CodexError {
     if response_started {
         CodexError {
@@ -2117,13 +2135,7 @@ where
                 invalidate_pool_owner(pool_owner, pool_entry);
                 return Err(quota_or_websocket_error(
                     quota_failure_hint.as_ref(),
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket stream error: {e}"),
-                        detail: None,
-                        retry_after: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    },
+                    websocket_stream_error(e),
                 ));
             }
             None => {
@@ -2280,13 +2292,7 @@ where
             Some(Err(error)) => {
                 terminal_item = Some(Err(quota_or_websocket_error(
                     quota_failure_hint.as_ref(),
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket stream error: {error}"),
-                        detail: None,
-                        retry_after: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    },
+                    websocket_stream_error(error),
                 )));
                 break;
             }
@@ -2338,6 +2344,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::*;
+
+    #[test]
+    fn io_stream_errors_have_structured_transport_detail() {
+        let message = concat!(
+            "peer closed connection without sending TLS close_notify: ",
+            "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+        );
+        let error = websocket_stream_error(WebSocketError::Io(std::io::Error::other(message)));
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL)
+        );
+        assert!(error.message.contains(message));
+        assert!(is_stream_transport_error(&error));
+    }
 
     #[test]
     fn provider_retry_handoff_is_attempt_local() {
