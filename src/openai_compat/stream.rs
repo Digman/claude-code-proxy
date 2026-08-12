@@ -11,8 +11,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
 use crate::{
-    provider::{Generation, GenerationBody},
-    providers::codex::native::NativeResponseOutcome,
+    provider::{Generation, GenerationBody, ResponseOutcome},
     traffic::{MAX_SSE_CAPTURE_BYTES, TrafficCapture},
 };
 
@@ -162,7 +161,7 @@ fn streaming_response(
     renderer: Renderer,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Response {
-    let outcome = NativeResponseOutcome::default();
+    let outcome = ResponseOutcome::default();
     let state = StreamState {
         body: match body {
             GenerationBody::BufferedSse(bytes) => Body::from(bytes),
@@ -205,7 +204,7 @@ struct StreamState {
     pending: VecDeque<Bytes>,
     finished: bool,
     bytes: usize,
-    outcome: NativeResponseOutcome,
+    outcome: ResponseOutcome,
     traffic: Option<Arc<TrafficCapture>>,
     downstream: Vec<u8>,
     downstream_truncated: bool,

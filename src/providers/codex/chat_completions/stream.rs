@@ -6,11 +6,9 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
-use crate::providers::codex::{
-    events::{CodexEventFailure, quota_failure_hint},
-    native::NativeResponseOutcome,
-};
-use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
+use crate::provider::{RequestContext, ResponseOutcome};
+use crate::providers::codex::events::{CodexEventFailure, quota_failure_hint};
+use crate::traffic::MAX_SSE_CAPTURE_BYTES;
 
 use super::{ChatError, response::CompletionState};
 
@@ -23,7 +21,7 @@ pub fn streaming_response(
     include_usage: bool,
     body_idle_timeout_ms: u64,
 ) -> Response {
-    let outcome = NativeResponseOutcome::default();
+    let outcome = ResponseOutcome::default();
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
         pending: Vec::new(),
@@ -116,7 +114,7 @@ struct StreamState {
     ended: bool,
     generation_started: bool,
     ctx: RequestContext,
-    outcome: NativeResponseOutcome,
+    outcome: ResponseOutcome,
     body_idle_timeout_ms: u64,
     raw: Vec<u8>,
     raw_truncated: u64,

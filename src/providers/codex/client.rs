@@ -2113,6 +2113,9 @@ impl CodexHttpClient {
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
                         socket_id_publisher.mark_full_context_retry();
+                        if super::websocket::is_response_timeout_error(&err) {
+                            socket_id_publisher.mark_response_timeout_retry();
+                        }
                         continuation = full_context_continuation(continuation.as_ref());
                         continuation_retry_available = false;
                         continue 'attempt;
@@ -2221,6 +2224,9 @@ impl CodexHttpClient {
                     && !forwarded_any
                 {
                     socket_id_publisher.mark_full_context_retry();
+                    if super::websocket::is_response_timeout_error(err) {
+                        socket_id_publisher.mark_response_timeout_retry();
+                    }
                     continuation = full_context_continuation(continuation.as_ref());
                     continuation_retry_available = false;
                     continue 'attempt;

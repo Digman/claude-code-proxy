@@ -28,7 +28,7 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{CliHandlers, Provider, RequestContext, ResponseOutcome};
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, sleep};
@@ -59,6 +59,7 @@ use self::translate::request::{
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
+const MAX_RESPONSE_TIMEOUT_RETRIES: u32 = 1;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -695,6 +696,7 @@ enum LiveStreamStart {
     Retry {
         error: client::CodexError,
         full_context_retry_attempted: bool,
+        response_timeout_retry_attempted: bool,
     },
 }
 
@@ -723,6 +725,7 @@ async fn live_stream_response(
         compaction.attempt,
     );
     let mut attempt = 0_u32;
+    let mut response_timeout_retries = 0_u32;
     let mut continuation = Some(continuation);
 
     loop {
@@ -759,9 +762,12 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                if live_retry_limit_reached(&err, attempt, response_timeout_retries) {
                     cleanup.abort();
                     return map_codex_error_to_response(&err);
+                }
+                if is_websocket_response_timeout(&err) {
+                    response_timeout_retries += 1;
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
@@ -796,6 +802,7 @@ async fn live_stream_response(
             LiveStreamStart::Retry {
                 error,
                 full_context_retry_attempted,
+                response_timeout_retry_attempted,
             } => {
                 // The incremental HTTP reader performs its own bounded
                 // pre-semantic retries so it can stop immediately when the
@@ -814,9 +821,15 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                if response_timeout_retry_attempted {
+                    response_timeout_retries = response_timeout_retries.max(1);
+                }
+                if live_retry_limit_reached(&error, attempt, response_timeout_retries) {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
+                }
+                if is_websocket_response_timeout(&error) {
+                    response_timeout_retries += 1;
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
@@ -835,10 +848,12 @@ fn provider_retry(
     error: client::CodexError,
 ) -> LiveStreamStart {
     let full_context_retry_attempted = upstream_events.used_full_context_retry();
+    let response_timeout_retry_attempted = upstream_events.used_response_timeout_retry();
     upstream_events.mark_provider_retry_handoff();
     LiveStreamStart::Retry {
         error,
         full_context_retry_attempted,
+        response_timeout_retry_attempted,
     }
 }
 
@@ -1060,6 +1075,8 @@ fn remaining_live_stream_response(
     mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
 ) -> Response {
+    let outcome = ResponseOutcome::default();
+    let task_outcome = outcome.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
@@ -1126,6 +1143,7 @@ fn remaining_live_stream_response(
                             let error_message = failure
                                 .as_ref()
                                 .map_or(message.as_str(), |failure| failure.message.as_str());
+                            task_outcome.fail(error_message.to_string());
                             let chunk = translator.error_chunk(
                                 error_message,
                                 error_type,
@@ -1178,11 +1196,10 @@ fn remaining_live_stream_response(
                         }
                     }
                     let error_type = codex_stream_error_type(&err);
-                    let chunk = translator.error_chunk(
-                        codex_error_message(&err),
-                        error_type,
-                        ctx.traffic.as_deref(),
-                    );
+                    let error_message = codex_error_message(&err);
+                    task_outcome.fail(error_message.to_string());
+                    let chunk =
+                        translator.error_chunk(error_message, error_type, ctx.traffic.as_deref());
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         let _ = tx.send(Ok(Bytes::from(chunk))).await;
@@ -1203,11 +1220,9 @@ fn remaining_live_stream_response(
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
             return;
         }
-        let chunk = translator.error_chunk(
-            "Upstream event stream closed before terminal Codex response event",
-            "api_error",
-            ctx.traffic.as_deref(),
-        );
+        let error_message = "Upstream event stream closed before terminal Codex response event";
+        task_outcome.fail(error_message.to_string());
+        let chunk = translator.error_chunk(error_message, "api_error", ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
@@ -1217,7 +1232,9 @@ fn remaining_live_stream_response(
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
-    event_stream_response(stream)
+    let mut response = event_stream_response(stream);
+    response.extensions_mut().insert(outcome);
+    response
 }
 
 fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
@@ -1285,6 +1302,20 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
     events::event_is_success_terminal(payload)
 }
 
+fn live_retry_limit_reached(
+    err: &client::CodexError,
+    attempt: u32,
+    response_timeout_retries: u32,
+) -> bool {
+    attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+        || (is_websocket_response_timeout(err)
+            && response_timeout_retries >= MAX_RESPONSE_TIMEOUT_RETRIES)
+}
+
+fn is_websocket_response_timeout(err: &client::CodexError) -> bool {
+    websocket::is_response_timeout_error(err)
+}
+
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
@@ -1292,7 +1323,8 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         }
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
-    matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
+    is_websocket_response_timeout(err)
+        || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
 
@@ -1986,6 +2018,95 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_stream_failure_after_semantic_output_sets_response_outcome() {
+        use http_body_util::BodyExt as _;
+
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "stream-outcome-failure".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_up"}
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "first"
+        })))
+        .await
+        .unwrap();
+
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        let response = match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => panic!("unexpected retry: {error}"),
+        };
+        let outcome = response
+            .extensions()
+            .get::<ResponseOutcome>()
+            .cloned()
+            .expect("remaining stream must expose an outcome");
+        let mut body = response.into_body();
+        body.frame().await.unwrap().unwrap();
+
+        let message = "WebSocket idle timeout after 300000ms";
+        tx.send(Err(client::CodexError {
+            status: 0,
+            message: message.to_string(),
+            detail: Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut downstream = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                downstream.extend_from_slice(&data);
+            }
+        }
+        assert!(String::from_utf8_lossy(&downstream).contains("event: error"));
+        assert_eq!(outcome.failure().as_deref(), Some(message));
+    }
+
     #[test]
     fn supported_models_includes_fast_variants() {
         let provider = CodexProvider::new();
@@ -2083,6 +2204,77 @@ mod tests {
             map_codex_error_to_response(&err).status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn live_start_response_timeouts_use_structured_retry_classification() {
+        for detail in [
+            websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL,
+            websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL,
+        ] {
+            let err = client::CodexError {
+                status: 0,
+                message: "timeout wording does not control retry".to_string(),
+                detail: Some(detail.to_string()),
+                retry_after: None,
+                origin: client::CodexErrorOrigin::WebSocket,
+            };
+
+            assert!(is_websocket_response_timeout(&err));
+            assert!(retryable_live_start_codex_error(&err));
+            assert!(!live_retry_limit_reached(&err, 0, 0));
+            assert!(live_retry_limit_reached(
+                &err,
+                1,
+                MAX_RESPONSE_TIMEOUT_RETRIES
+            ));
+        }
+    }
+
+    #[test]
+    fn internal_continuation_timeout_consumes_provider_timeout_budget() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket idle timeout after 300000ms".to_string(),
+            detail: Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (stream, publisher) = websocket::CodexWebSocketEventStream::pending(rx);
+        publisher.mark_full_context_retry();
+        publisher.mark_response_timeout_retry();
+        let retry = provider_retry(&stream, err);
+        drop(tx);
+
+        let LiveStreamStart::Retry {
+            error,
+            response_timeout_retry_attempted,
+            ..
+        } = retry
+        else {
+            panic!("expected provider retry");
+        };
+        let response_timeout_retries = u32::from(response_timeout_retry_attempted);
+        assert!(live_retry_limit_reached(
+            &error,
+            0,
+            response_timeout_retries
+        ));
+    }
+
+    #[test]
+    fn response_timeout_classification_requires_websocket_origin() {
+        let err = client::CodexError {
+            status: 0,
+            message: "timeout wording does not control retry".to_string(),
+            detail: Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::Http,
+        };
+
+        assert!(!is_websocket_response_timeout(&err));
+        assert!(!retryable_live_start_codex_error(&err));
     }
 
     #[test]

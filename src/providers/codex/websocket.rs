@@ -41,6 +41,7 @@ pub const WEBSOCKET_PROTOCOL_HEADER: &str = "responses_websockets=2026-02-06";
 pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
+pub const WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL: &str = "websocket_response_idle_timeout";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
 pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
@@ -61,6 +62,7 @@ pub(crate) struct CodexWebSocketEventStream {
     receiver: CodexWebSocketEventReceiver,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
+    response_timeout_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
 }
 
@@ -68,6 +70,7 @@ pub(crate) struct CodexWebSocketEventStream {
 pub(crate) struct CodexWebSocketSocketIdPublisher {
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
+    response_timeout_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
 }
 
@@ -77,17 +80,20 @@ impl CodexWebSocketEventStream {
     ) -> (Self, CodexWebSocketSocketIdPublisher) {
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
+        let response_timeout_retry = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
         (
             Self {
                 receiver,
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
+                response_timeout_retry: response_timeout_retry.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
             },
             CodexWebSocketSocketIdPublisher {
                 socket_id,
                 full_context_retry,
+                response_timeout_retry,
                 provider_retry_handoff,
             },
         )
@@ -106,6 +112,10 @@ impl CodexWebSocketEventStream {
 
     pub(crate) fn used_full_context_retry(&self) -> bool {
         self.full_context_retry.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn used_response_timeout_retry(&self) -> bool {
+        self.response_timeout_retry.load(Ordering::Acquire)
     }
 
     pub(crate) fn mark_provider_retry_handoff(&self) {
@@ -132,6 +142,10 @@ impl CodexWebSocketSocketIdPublisher {
 
     pub(super) fn mark_full_context_retry(&self) {
         self.full_context_retry.store(true, Ordering::Release);
+    }
+
+    pub(super) fn mark_response_timeout_retry(&self) {
+        self.response_timeout_retry.store(true, Ordering::Release);
     }
 
     pub(super) fn is_provider_retry_handoff(&self) -> bool {
@@ -1178,13 +1192,32 @@ fn quota_or_websocket_error(
     }
 }
 
-fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
-    CodexError {
-        status: 0,
-        message: format!("WebSocket response start timeout after {timeout_ms}ms"),
-        detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
-        retry_after: None,
-        origin: CodexErrorOrigin::WebSocket,
+pub(super) fn is_response_timeout_error(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocket
+        && matches!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+                | Some(WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL)
+        )
+}
+
+fn response_timeout_error(response_started: bool, timeout_ms: u64) -> CodexError {
+    if response_started {
+        CodexError {
+            status: 0,
+            message: format!("WebSocket idle timeout after {timeout_ms}ms"),
+            detail: Some(WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }
+    } else {
+        CodexError {
+            status: 0,
+            message: format!("WebSocket response start timeout after {timeout_ms}ms"),
+            detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }
     }
 }
 
@@ -1979,35 +2012,17 @@ where
         } else {
             response_wait_started
         };
-        let read_timeout = if response_started {
+        let read_timeout =
             match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
                     invalidate_pool_owner(pool_owner, pool_entry);
                     return Err(quota_or_websocket_error(
                         quota_failure_hint.as_ref(),
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        },
+                        response_timeout_error(response_started, idle_timeout_ms),
                     ));
                 }
-            }
-        } else {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(quota_or_websocket_error(
-                        quota_failure_hint.as_ref(),
-                        response_start_timeout_error(idle_timeout_ms),
-                    ));
-                }
-            }
-        };
+            };
 
         let timeout = tokio::time::timeout(read_timeout, ws.next());
 
@@ -2015,17 +2030,7 @@ where
             invalidate_pool_owner(pool_owner, pool_entry);
             quota_or_websocket_error(
                 quota_failure_hint.as_ref(),
-                if response_started {
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                },
+                response_timeout_error(response_started, idle_timeout_ms),
             )
         })?;
 
@@ -2166,28 +2171,17 @@ where
         } else {
             response_wait_started
         };
-        let read_timeout = match response_event_budget
-            .checked_sub(response_deadline_started.elapsed())
-        {
-            Some(remaining) if !remaining.is_zero() => remaining,
-            _ => {
-                terminal_item = Some(Err(quota_or_websocket_error(
-                    quota_failure_hint.as_ref(),
-                    if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    },
-                )));
-                break;
-            }
-        };
+        let read_timeout =
+            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    terminal_item = Some(Err(quota_or_websocket_error(
+                        quota_failure_hint.as_ref(),
+                        response_timeout_error(response_started, idle_timeout_ms),
+                    )));
+                    break;
+                }
+            };
 
         let frame = tokio::select! {
             biased;
@@ -2197,19 +2191,7 @@ where
                 Err(_) => {
                     terminal_item = Some(Err(quota_or_websocket_error(
                         quota_failure_hint.as_ref(),
-                        if response_started {
-                            CodexError {
-                                status: 0,
-                                message: format!(
-                                    "WebSocket idle timeout after {idle_timeout_ms}ms"
-                                ),
-                                detail: None,
-                                retry_after: None,
-                                origin: CodexErrorOrigin::WebSocket,
-                            }
-                        } else {
-                            response_start_timeout_error(idle_timeout_ms)
-                        },
+                        response_timeout_error(response_started, idle_timeout_ms),
                     )));
                     break;
                 }
@@ -4080,7 +4062,10 @@ mod tests {
         };
 
         assert!(err.message.contains("idle timeout"));
-        assert_eq!(err.detail, None);
+        assert_eq!(
+            err.detail.as_deref(),
+            Some(WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL)
+        );
         assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
     }
 

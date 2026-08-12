@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{RequestContext, ResponseOutcome},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -16,9 +16,7 @@ use crate::{
             MAX_GENERATION_REQUEST_BYTES, MultipartEditInput, UploadedImage, image_error_response,
             prepare_json_request, prepare_multipart_edit,
         },
-        native::{
-            CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
-        },
+        native::{CodexNativeBackend, openai_error, validate_native_request_model},
         transcription::{
             CodexTranscriptionBackend, MAX_TRANSCRIPTION_REQUEST_BYTES, TranscriptionRequestError,
             prepare_transcription, transcription_error_response,
@@ -1785,10 +1783,7 @@ async fn dispatch_request(
 
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
     let status = response.status();
-    let outcome = response
-        .extensions()
-        .get::<NativeResponseOutcome>()
-        .cloned();
+    let outcome = response.extensions().get::<ResponseOutcome>().cloned();
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
         (body, guard, outcome),
@@ -1800,8 +1795,7 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
                     Some((Err(err), (body, guard, outcome)))
                 }
                 None => {
-                    if let Some(message) = outcome.as_ref().and_then(NativeResponseOutcome::failure)
-                    {
+                    if let Some(message) = outcome.as_ref().and_then(ResponseOutcome::failure) {
                         guard.failed(status, message);
                     } else if status.is_success() {
                         guard.completed(status);
@@ -2146,8 +2140,13 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
+    use super::{
+        RequestMonitorGuard, apply_auto_review_model, headers_to_record,
+        is_claude_auto_review_request, monitor_response_body,
+    };
     use crate::anthropic::schema::MessagesRequest;
+    use crate::monitor::{EndpointKind, MonitorHandle, RequestStatus};
+    use crate::provider::ResponseOutcome;
     use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
@@ -2162,6 +2161,36 @@ mod auto_review_tests {
             "tools": tools
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_outcome_marks_successful_http_stream_failed() {
+        use http_body_util::BodyExt as _;
+
+        let monitor = MonitorHandle::new(10);
+        let req_id = "stream-outcome";
+        monitor.request_started(req_id, None, None, EndpointKind::Messages);
+        let outcome = ResponseOutcome::default();
+        outcome.fail("WebSocket idle timeout after 300000ms".to_string());
+        let mut response =
+            axum::response::Response::new(axum::body::Body::from("event: error\n\n"));
+        response.extensions_mut().insert(outcome);
+        let response = monitor_response_body(
+            response,
+            RequestMonitorGuard::new(Some(monitor.clone()), req_id.to_string()),
+        );
+
+        response.into_body().collect().await.unwrap();
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(state.recent[0].status, RequestStatus::Failed);
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("WebSocket idle timeout after 300000ms")
+        );
     }
 
     #[test]

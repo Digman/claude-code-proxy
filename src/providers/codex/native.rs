@@ -1,6 +1,6 @@
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -11,7 +11,8 @@ use http::{HeaderMap, HeaderName, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
-use crate::provider::RequestContext;
+pub use crate::provider::ResponseOutcome as NativeResponseOutcome;
+use crate::provider::{RequestContext, ResponseOutcome};
 use crate::traffic::{
     MAX_SSE_CAPTURE_BYTES, MAX_STREAM_CAPTURE_EVENT_BYTES, MAX_STREAM_CAPTURE_EVENTS,
     MAX_STREAM_CAPTURE_FRAME_BYTES,
@@ -213,25 +214,6 @@ pub fn openai_error(
         .into_response()
 }
 
-#[derive(Clone, Default)]
-pub struct NativeResponseOutcome {
-    failure: Arc<Mutex<Option<String>>>,
-}
-
-impl NativeResponseOutcome {
-    pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
-    }
-
-    pub(crate) fn fail(&self, message: String) {
-        if let Ok(mut failure) = self.failure.lock()
-            && failure.is_none()
-        {
-            *failure = Some(message);
-        }
-    }
-}
-
 fn passthrough_response(
     upstream: reqwest::Response,
     ctx: RequestContext,
@@ -244,7 +226,7 @@ fn passthrough_response(
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
-    let outcome = NativeResponseOutcome::default();
+    let outcome = ResponseOutcome::default();
     let observer = NativeResponseObserver::new(ctx, is_sse, outcome.clone());
     let state = Some(NativeBodyState {
         stream: Box::pin(upstream.bytes_stream()),
@@ -336,12 +318,12 @@ struct NativeResponseObserver {
     captured_events_truncated: u64,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    outcome: NativeResponseOutcome,
+    outcome: ResponseOutcome,
     finished: bool,
 }
 
 impl NativeResponseObserver {
-    fn new(ctx: RequestContext, is_sse: bool, outcome: NativeResponseOutcome) -> Self {
+    fn new(ctx: RequestContext, is_sse: bool, outcome: ResponseOutcome) -> Self {
         Self {
             ctx,
             is_sse,
@@ -622,7 +604,7 @@ mod tests {
 
     #[test]
     fn failed_sse_event_records_native_outcome() {
-        let outcome = NativeResponseOutcome::default();
+        let outcome = ResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), true, outcome.clone());
         observer.observe(
             b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"generation failed\"}}}\n\n",
@@ -633,7 +615,7 @@ mod tests {
 
     #[test]
     fn completed_json_with_null_error_stays_successful() {
-        let outcome = NativeResponseOutcome::default();
+        let outcome = ResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
         observer
             .observe(br#"{"id":"resp_ok","object":"response","status":"completed","error":null}"#);
@@ -644,7 +626,7 @@ mod tests {
 
     #[test]
     fn failed_json_records_error_message() {
-        let outcome = NativeResponseOutcome::default();
+        let outcome = ResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
         observer.observe(
             br#"{"id":"resp_failed","object":"response","status":"failed","error":{"message":"request failed"}}"#,
@@ -656,7 +638,7 @@ mod tests {
 
     #[test]
     fn response_error_event_records_failure() {
-        let outcome = NativeResponseOutcome::default();
+        let outcome = ResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), true, outcome.clone());
         observer.observe(
             b"event: response.error\ndata: {\"type\":\"response.error\",\"response\":{\"error\":{\"message\":\"stream error\"}}}\n\n",
@@ -668,7 +650,7 @@ mod tests {
     #[test]
     fn event_capture_obeys_count_limit() {
         let temp = tempfile::TempDir::new().unwrap();
-        let outcome = NativeResponseOutcome::default();
+        let outcome = ResponseOutcome::default();
         let mut context = observer_context();
         context.traffic = Some(Arc::new(crate::traffic::test_capture(
             temp.path().to_path_buf(),

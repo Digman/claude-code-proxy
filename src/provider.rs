@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use clap::Subcommand;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
@@ -59,6 +59,26 @@ pub trait Provider: Send + Sync {
 pub enum GenerationBody {
     BufferedSse(Bytes),
     LiveSse(Body),
+}
+
+/// Shares an in-band streaming failure with the server after a successful HTTP response starts.
+#[derive(Clone, Default)]
+pub struct ResponseOutcome {
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl ResponseOutcome {
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    pub(crate) fn fail(&self, message: String) {
+        if let Ok(mut failure) = self.failure.lock()
+            && failure.is_none()
+        {
+            *failure = Some(message);
+        }
+    }
 }
 
 pub struct Generation {
