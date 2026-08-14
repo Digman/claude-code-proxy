@@ -2917,6 +2917,9 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.detail.as_deref() == Some("websocket_pre_request") {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
+    if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL) {
+        return true;
+    }
     if err.status != 0 {
         return false;
     }
@@ -2929,6 +2932,8 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
         || message.contains("timed out")
         || message.contains("econnreset")
         || message.contains("etimedout")
+        || message.contains("broken pipe")
+        || message.contains("epipe")
 }
 
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
@@ -3026,6 +3031,7 @@ pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
             | Some(super::websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL)
             | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
             | Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
+            | Some(super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL)
     )
 }
 
@@ -4974,6 +4980,33 @@ mod tests {
             status: 0,
             message: "WebSocket protocol error: Connection reset without closing handshake"
                 .to_string(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(is_retryable_transport_error(&err));
+    }
+
+    #[test]
+    fn keepalive_failure_is_retryable_with_full_context() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket keepalive error: test write failed".to_string(),
+            detail: Some(super::super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(is_retryable_transport_error(&err));
+        assert!(is_continuation_retry_error(&err));
+    }
+
+    #[test]
+    fn statusless_broken_pipe_is_retryable() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket stream error: IO error: Broken pipe (os error 32)".to_string(),
             detail: None,
             retry_after: None,
             origin: CodexErrorOrigin::WebSocket,

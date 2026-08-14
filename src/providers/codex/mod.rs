@@ -1323,6 +1323,9 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         }
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
+    if err.detail.as_deref() == Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL) {
+        return true;
+    }
     is_websocket_response_timeout(err)
         || websocket::is_stream_transport_error(err)
         || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
@@ -2322,6 +2325,19 @@ mod tests {
         };
 
         assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn live_start_keepalive_failure_is_retryable() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket keepalive error: test write failed".to_string(),
+            detail: Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(retryable_live_start_codex_error(&err));
     }
 
     #[test]

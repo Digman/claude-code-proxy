@@ -43,6 +43,7 @@ pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 pub const WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL: &str = "websocket_response_idle_timeout";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
+pub const WEBSOCKET_KEEPALIVE_FAILURE_DETAIL: &str = "websocket_keepalive_failure";
 pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
 pub(super) const WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL: &str = "websocket_stream_transport_error";
@@ -55,6 +56,8 @@ const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
 const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
+const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const WEBSOCKET_KEEPALIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type CodexWebSocketEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
@@ -1219,6 +1222,16 @@ fn websocket_stream_error(error: WebSocketError) -> CodexError {
     }
 }
 
+fn websocket_keepalive_error(error: String) -> CodexError {
+    CodexError {
+        status: 0,
+        message: format!("WebSocket keepalive error: {error}"),
+        detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn response_timeout_error(response_started: bool, timeout_ms: u64) -> CodexError {
     if response_started {
         CodexError {
@@ -2001,6 +2014,55 @@ async fn connect_with_timeout(
 // Event collection
 // ---------------------------------------------------------------------------
 
+enum WebSocketRead {
+    Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+    Timeout,
+    KeepaliveError(String),
+}
+
+async fn read_ws_frame_with_keepalive<S>(
+    ws: &mut WebSocketStream<S>,
+    read_timeout: Duration,
+    keepalive_interval: Duration,
+) -> WebSocketRead
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let timeout = tokio::time::sleep(read_timeout);
+    tokio::pin!(timeout);
+    let mut keepalive = tokio::time::interval(keepalive_interval);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            frame = ws.next() => return WebSocketRead::Frame(frame),
+            _ = &mut timeout => return WebSocketRead::Timeout,
+            _ = keepalive.tick() => {
+                let send = ws.send(Message::Ping(Vec::new()));
+                let send_timeout = tokio::time::sleep(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT);
+                tokio::pin!(send_timeout);
+                tokio::select! {
+                    biased;
+                    result = send => {
+                        if let Err(error) = result {
+                            return WebSocketRead::KeepaliveError(error.to_string());
+                        }
+                    }
+                    _ = &mut timeout => return WebSocketRead::Timeout,
+                    _ = &mut send_timeout => {
+                        return WebSocketRead::KeepaliveError(format!(
+                            "send timed out after {}ms",
+                            WEBSOCKET_KEEPALIVE_SEND_TIMEOUT.as_millis(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct WsEvent {
     event_type: String,
     payload: serde_json::Value,
@@ -2012,6 +2074,28 @@ async fn collect_ws_events<S>(
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
+) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    collect_ws_events_with_keepalive_interval(
+        ws,
+        idle_timeout_ms,
+        pool_owner,
+        pool_entry,
+        traffic,
+        WEBSOCKET_KEEPALIVE_INTERVAL,
+    )
+    .await
+}
+
+async fn collect_ws_events_with_keepalive_interval<S>(
+    ws: &mut WebSocketStream<S>,
+    idle_timeout_ms: u64,
+    pool_owner: Option<&ConversationIdentity>,
+    pool_entry: Option<&Arc<PoolEntry>>,
+    traffic: Option<&TrafficCapture>,
+    keepalive_interval: Duration,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2042,15 +2126,23 @@ where
                 }
             };
 
-        let timeout = tokio::time::timeout(read_timeout, ws.next());
-
-        let frame = timeout.await.map_err(|_| {
-            invalidate_pool_owner(pool_owner, pool_entry);
-            quota_or_websocket_error(
-                quota_failure_hint.as_ref(),
-                response_timeout_error(response_started, idle_timeout_ms),
-            )
-        })?;
+        let frame = match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval).await {
+            WebSocketRead::Frame(frame) => frame,
+            WebSocketRead::Timeout => {
+                invalidate_pool_owner(pool_owner, pool_entry);
+                return Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    response_timeout_error(response_started, idle_timeout_ms),
+                ));
+            }
+            WebSocketRead::KeepaliveError(error) => {
+                invalidate_pool_owner(pool_owner, pool_entry);
+                return Err(quota_or_websocket_error(
+                    quota_failure_hint.as_ref(),
+                    websocket_keepalive_error(error),
+                ));
+            }
+        };
 
         match frame {
             Some(Ok(Message::Text(text))) => {
@@ -2198,12 +2290,23 @@ where
         let frame = tokio::select! {
             biased;
             _ = tx.closed() => break,
-            frame = tokio::time::timeout(read_timeout, ws.next()) => match frame {
-                Ok(frame) => frame,
-                Err(_) => {
+            frame = read_ws_frame_with_keepalive(
+                ws,
+                read_timeout,
+                WEBSOCKET_KEEPALIVE_INTERVAL,
+            ) => match frame {
+                WebSocketRead::Frame(frame) => frame,
+                WebSocketRead::Timeout => {
                     terminal_item = Some(Err(quota_or_websocket_error(
                         quota_failure_hint.as_ref(),
                         response_timeout_error(response_started, idle_timeout_ms),
+                    )));
+                    break;
+                }
+                WebSocketRead::KeepaliveError(error) => {
+                    terminal_item = Some(Err(quota_or_websocket_error(
+                        quota_failure_hint.as_ref(),
+                        websocket_keepalive_error(error),
                     )));
                     break;
                 }
@@ -2477,6 +2580,39 @@ mod tests {
             buffer: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailingWriteIo;
+
+    impl AsyncRead for FailingWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FailingWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test write failed",
+            )))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -4089,6 +4225,118 @@ mod tests {
             Some(WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL)
         );
         assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_response_wait_sends_keepalive_ping() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let server_task = tokio::spawn(async move {
+            let frame = server.next().await.unwrap().unwrap();
+            assert!(matches!(frame, Message::Ping(_)));
+            server
+                .send(Message::Text(r#"{"type":"response.created"}"#.into()))
+                .await
+                .unwrap();
+        });
+
+        let frame = read_ws_frame_with_keepalive(
+            &mut client,
+            Duration::from_secs(60),
+            WEBSOCKET_KEEPALIVE_INTERVAL,
+        )
+        .await;
+
+        assert!(matches!(
+            frame,
+            WebSocketRead::Frame(Some(Ok(Message::Text(text))))
+                if text.contains("response.created")
+        ));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_keepalive_write_returns_stable_error() {
+        let mut client = WebSocketStream::from_raw_socket(FailingWriteIo, Role::Client, None).await;
+
+        let error = match collect_ws_events_with_keepalive_interval(
+            &mut client,
+            60_000,
+            None,
+            None,
+            None,
+            WEBSOCKET_KEEPALIVE_INTERVAL,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected keepalive failure"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL)
+        );
+        assert!(error.message.contains("keepalive error"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_live_keepalive_write_returns_stable_error() {
+        let mut client = WebSocketStream::from_raw_socket(FailingWriteIo, Role::Client, None).await;
+        let (tx, _rx) = mpsc::channel(1);
+
+        let (reusable, terminal_item) = stream_ws_events(&mut client, 60_000, None, &tx).await;
+        let error = terminal_item
+            .expect("expected terminal keepalive failure")
+            .expect_err("expected keepalive error");
+
+        assert!(!reusable);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL)
+        );
+        assert!(error.message.contains("keepalive error"));
+    }
+
+    #[tokio::test]
+    async fn keepalive_pongs_do_not_extend_response_start_timeout() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let ping_count = Arc::new(AtomicUsize::new(0));
+        let server_ping_count = ping_count.clone();
+        let server_task = tokio::spawn(async move {
+            while let Some(Ok(frame)) = server.next().await {
+                if let Message::Ping(payload) = frame {
+                    server_ping_count.fetch_add(1, Ordering::SeqCst);
+                    if server.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let error = match collect_ws_events_with_keepalive_interval(
+            &mut client,
+            50,
+            None,
+            None,
+            None,
+            Duration::from_millis(10),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected response start timeout"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+        );
+        assert!(ping_count.load(Ordering::SeqCst) >= 2);
+        server_task.abort();
     }
 
     async fn create_dummy_stream_async() -> CodexWebSocketStream {

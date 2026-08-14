@@ -24,12 +24,12 @@ The proxy owns and refreshes its Grok tokens. It does not read `~/.grok/auth.jso
 
 ## Models
 
-The registered IDs are `grok-composer-2.5-fast` and `grok-4.5`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
+The registered IDs are `grok-composer-2.5-fast`, `grok-4.5`, and `grok-4.6`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
 
 ```sh
-ANTHROPIC_MODEL=grok-4.5 \
-ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 \
-  claude --model grok-4.5
+ANTHROPIC_MODEL=grok-4.6 \
+ANTHROPIC_SMALL_FAST_MODEL=grok-4.6 \
+  claude --model grok-4.6
 ```
 
 ## Reasoning and tools

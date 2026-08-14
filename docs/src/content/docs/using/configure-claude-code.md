@@ -32,11 +32,10 @@ The proxy always makes streaming upstream requests. It can still accumulate a no
 
 A trailing `[1m]` tells Claude Code to use its larger local context policy. The proxy strips the suffix before upstream routing. It does not enlarge the provider's context window.
 
-For Codex GPT-5.6 subscription models, set the threshold explicitly:
-
-```sh
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
-```
+OpenAI's [GPT-5.6 subscription update](https://x.com/thsottiaux/status/2076495156757577895)
+sets the ChatGPT context limit to 272K tokens. Set
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
+compacts before the upstream limit.
 
 For a provider and model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
 

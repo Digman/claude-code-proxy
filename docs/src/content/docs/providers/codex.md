@@ -5,6 +5,12 @@ description: Configure ChatGPT Codex authentication, models, reasoning, tools, i
 
 Codex uses the ChatGPT subscription Responses endpoint at `https://chatgpt.com/backend-api/codex/responses`.
 
+OpenAI's Thibault Sottiaux has publicly welcomed using Codex through other coding
+harnesses:
+
+> [Share the recipe. People want to know how to use GPT-5.6 Sol in CC. We don't
+> discriminate on the harness.](https://x.com/thsottiaux/status/2075830097488249060)
+
 ## Account and authentication
 
 Sign in with a **ChatGPT Plus or Pro account**, not OpenAI API credentials.
