@@ -2587,7 +2587,7 @@ fn quota_or_stream_error(
         .unwrap_or(error)
 }
 
-fn retryable_http_stream_error(error: &CodexError) -> bool {
+pub(super) fn retryable_http_stream_error(error: &CodexError) -> bool {
     if should_retry_codex_status(error.status) || is_retryable_transport_error(error) {
         return true;
     }

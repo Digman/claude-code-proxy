@@ -15,7 +15,7 @@ Claude Code binds its base URL and client auth when the process starts. A **back
 ## One-shot aliases
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias csol='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude'
 alias cgrok='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 ```
 
@@ -43,11 +43,12 @@ if [ -f "$flag" ]; then
   export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$model}"
   export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-$model}"
   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-  export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 fi
 
 exec "$real_claude" "$@"
 ```
+
+The wrapper leaves `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` unset so its default Codex model can recover interruptions while a content block is still open. If a selected non-Codex provider shows duplicate tool calls, opt out explicitly for that provider's launch profile instead of disabling recovery globally.
 
 Toggle it with ordinary file operations:
 

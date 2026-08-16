@@ -46,7 +46,19 @@ Set `ANTHROPIC_SMALL_FAST_MODEL` to a concrete routable ID. Claude Code sends ti
 
 ## A tool runs twice
 
-Set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` for Claude Code. Retrying a partially completed stream as non-streaming can duplicate tool calls.
+Current Codex recovery finalizes a completed tool call before ending an interrupted stream, so Claude Code does not replay that tool turn. If duplication occurs through another provider or an older proxy, set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` for Claude Code. This also disables automatic recovery from incomplete streams.
+
+## Codex output stops after a VPN or proxy interruption
+
+Leave `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` unset and restart Claude Code after changing its environment. Retryable connection resets while a downstream content block is still open can then fall back to a non-streaming request. If the text block already closed before the transport failed, the proxy returns an explicit error to avoid silently accepting truncated output. The fallback is a new model request and cannot recover while the VPN remains unavailable.
+
+Keep the local Claude Code-to-proxy hop outside an HTTP proxy or VPN interception when possible:
+
+```sh
+NO_PROXY=127.0.0.1,localhost claude
+```
+
+If a network handles long WebSocket connections poorly, use `CCP_CODEX_TRANSPORT=http` on the proxy process to test HTTP SSE instead.
 
 ## Session reaches context limits
 

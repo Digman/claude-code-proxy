@@ -3,6 +3,10 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Codex sessions can recover from retryable mid-stream network interruptions through Claude Code's built-in non-streaming fallback while a content block is still open. Completed tool calls are finalized instead of replayed, closed text blocks fail explicitly instead of being silently truncated, and Codex setup examples now leave recovery enabled.
+
 ## v0.1.34 (2026-08-12)
 
 - Grok users can select Grok 4.6 with the `grok-4.6` model name.

@@ -13,7 +13,6 @@ ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```
 
@@ -24,9 +23,15 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 | `ANTHROPIC_MODEL` | Selects the main request model and therefore the provider. |
 | `ANTHROPIC_SMALL_FAST_MODEL` | Selects the model for title generation, token-related background work, and other small requests. Use a model the proxy routes. |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Reduces background traffic sent to the subscription provider. |
-| `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` | Prevents Claude Code from retrying a partially completed stream as non-streaming, which can duplicate tool calls. |
+| `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` | Opts out of Claude Code's non-streaming recovery for incomplete Codex streams. Leave it unset for automatic recovery. |
 
 The proxy always makes streaming upstream requests. It can still accumulate a non-streaming Anthropic response when the client requests one.
+
+## Interrupted Codex streams
+
+When a retryable Codex transport failure interrupts output while a downstream content block is still open, the proxy leaves the stream incomplete so Claude Code can retry the turn as a non-streaming request. A tool call that completed before the disconnect is finalized as `tool_use` instead, allowing Claude Code to execute it without replaying the model turn. If a text block already closed before the transport failed, the proxy returns an explicit stream error rather than silently accepting truncated output.
+
+Leave `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` unset to enable this recovery. Setting it to `1` opts out and makes these interruptions fail the turn. The fallback sends another model request, so recovered text can differ from the interrupted output.
 
 ## Compaction settings
 
@@ -51,8 +56,7 @@ If every Claude Code session should use the proxy, put client variables in `~/.c
     "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
     "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna[1m]",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 272000,
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
-    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
   }
 }
 ```

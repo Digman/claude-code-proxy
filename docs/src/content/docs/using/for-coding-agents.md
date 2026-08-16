@@ -33,8 +33,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:18765
 ANTHROPIC_AUTH_TOKEN=unused
 ANTHROPIC_MODEL=<routable-model-id>
 ANTHROPIC_SMALL_FAST_MODEL=<routable-model-id>
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 ```
+
+For Codex, leave `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` unset so Claude Code can recover retryable network interruptions while a content block is still open. Setting it to `1` opts out of that recovery. Other provider routes can have different tool-replay trade-offs; follow their provider and troubleshooting guidance.
 
 `ANTHROPIC_*` and `CLAUDE_CODE_*` configure the Claude Code client. `CCP_*`, `PORT`, and `config.json` configure the proxy process. Keep those layers separate when editing settings or debugging a launch.
 

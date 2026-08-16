@@ -2253,7 +2253,7 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
+async fn smoke_codex_http_body_error_after_semantic_output_leaves_stream_incomplete() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -2290,9 +2290,14 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
         text.contains("partial before body error"),
         "stream body: {text}"
     );
-    assert!(text.contains("event: error"), "stream body: {text}");
+    assert!(!text.contains("event: error"), "stream body: {text}");
     assert!(
-        text.contains("Transport error reading Codex response body"),
+        !text.contains("event: content_block_stop"),
+        "stream body: {text}"
+    );
+    assert!(!text.contains("event: message_stop"), "stream body: {text}");
+    assert!(
+        !text.contains("Transport error reading Codex response body"),
         "stream body: {text}"
     );
     assert!(
@@ -2303,7 +2308,55 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_body_error_after_closed_tool_is_not_success() {
+async fn smoke_codex_http_body_error_after_closed_text_is_explicit() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_truncated_http_upstream(concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_closed_text\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"closed before body error\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n"
+    ).as_bytes())
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("closed semantic stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("closed before body error"),
+        "stream body: {text}"
+    );
+    assert!(
+        text.contains("event: content_block_stop"),
+        "stream body: {text}"
+    );
+    assert!(text.contains("event: error"), "stream body: {text}");
+    assert!(!text.contains("event: message_stop"), "stream body: {text}");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_body_error_after_closed_tool_finishes_tool_turn() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -2334,12 +2387,16 @@ async fn smoke_codex_http_body_error_after_closed_tool_is_not_success() {
         .unwrap();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"name\":\"Read\""), "stream body: {text}");
-    assert!(text.contains("event: error"), "stream body: {text}");
     assert!(
-        text.contains("Transport error reading Codex response body"),
+        text.contains(r#""stop_reason":"tool_use""#),
         "stream body: {text}"
     );
-    assert!(!text.contains("event: message_stop"), "stream body: {text}");
+    assert!(text.contains("event: message_stop"), "stream body: {text}");
+    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert!(
+        !text.contains("Transport error reading Codex response body"),
+        "stream body: {text}"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]

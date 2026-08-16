@@ -1054,6 +1054,16 @@ fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
     }
 }
 
+fn track_open_content_blocks(open_blocks: &mut usize, chunk: &[u8]) {
+    for event in parse_sse_events(chunk) {
+        match event.event.as_deref() {
+            Some("content_block_start") => *open_blocks += 1,
+            Some("content_block_stop") => *open_blocks = open_blocks.saturating_sub(1),
+            _ => {}
+        }
+    }
+}
+
 fn single_live_stream_response(chunk: Vec<u8>) -> Response {
     event_stream_response(futures_util::stream::once(async move {
         Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
@@ -1079,6 +1089,8 @@ fn remaining_live_stream_response(
     let task_outcome = outcome.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
+        let mut open_content_blocks = 0;
+        track_open_content_blocks(&mut open_content_blocks, &first_chunk);
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),
@@ -1157,6 +1169,7 @@ fn remaining_live_stream_response(
                         }
                     };
                     if !chunk.is_empty() {
+                        track_open_content_blocks(&mut open_content_blocks, &chunk);
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
@@ -1186,18 +1199,19 @@ fn remaining_live_stream_response(
                         &request_continuation,
                         compaction.attempt,
                     );
-                    if err.origin == client::CodexErrorOrigin::WebSocket {
-                        let chunk = translator
-                            .finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
-                        if !chunk.is_empty() {
-                            record_live_stream_progress(&ctx, &chunk);
-                            let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                            return;
-                        }
+                    let chunk =
+                        translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
+                    if !chunk.is_empty() {
+                        record_live_stream_progress(&ctx, &chunk);
+                        let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                        return;
                     }
                     let error_type = codex_stream_error_type(&err);
                     let error_message = codex_error_message(&err);
                     task_outcome.fail(error_message.to_string());
+                    if open_content_blocks > 0 && post_output_stream_interrupted(&err) {
+                        return;
+                    }
                     let chunk =
                         translator.error_chunk(error_message, error_type, ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -1222,6 +1236,9 @@ fn remaining_live_stream_response(
         }
         let error_message = "Upstream event stream closed before terminal Codex response event";
         task_outcome.fail(error_message.to_string());
+        if open_content_blocks > 0 {
+            return;
+        }
         let chunk = translator.error_chunk(error_message, "api_error", ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
@@ -1330,6 +1347,18 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         || websocket::is_stream_transport_error(err)
         || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
+}
+
+fn post_output_stream_interrupted(err: &client::CodexError) -> bool {
+    if err.status != 0 {
+        return false;
+    }
+
+    match err.origin {
+        client::CodexErrorOrigin::Http => client::retryable_http_stream_error(err),
+        client::CodexErrorOrigin::WebSocket => retryable_live_start_codex_error(err),
+        _ => false,
+    }
 }
 
 fn is_missing_previous_response_error(err: &client::CodexError) -> bool {
@@ -2023,7 +2052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_stream_failure_after_semantic_output_sets_response_outcome() {
+    async fn live_stream_transport_failure_after_semantic_output_leaves_stream_incomplete() {
         use http_body_util::BodyExt as _;
 
         let body = request_with_tools(serde_json::json!([]));
@@ -2107,7 +2136,10 @@ mod tests {
                 downstream.extend_from_slice(&data);
             }
         }
-        assert!(String::from_utf8_lossy(&downstream).contains("event: error"));
+        let downstream = String::from_utf8_lossy(&downstream);
+        assert!(!downstream.contains("event: error"));
+        assert!(!downstream.contains("event: content_block_stop"));
+        assert!(!downstream.contains("event: message_stop"));
         assert_eq!(outcome.failure().as_deref(), Some(message));
     }
 
@@ -2299,6 +2331,24 @@ mod tests {
         assert!(retryable_live_start_codex_error(&err));
         err.origin = client::CodexErrorOrigin::Http;
         assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn post_output_recovery_only_hands_off_statusless_stream_interruptions() {
+        let mut err = client::CodexError {
+            status: 0,
+            message: "Transport error reading Codex response body: connection reset".to_string(),
+            detail: Some("http_response_body".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::Http,
+        };
+
+        assert!(post_output_stream_interrupted(&err));
+        err.status = 503;
+        assert!(!post_output_stream_interrupted(&err));
+        err.status = 0;
+        err.origin = client::CodexErrorOrigin::BufferedHttp;
+        assert!(!post_output_stream_interrupted(&err));
     }
 
     #[test]
