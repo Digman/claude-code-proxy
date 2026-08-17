@@ -1322,6 +1322,8 @@ impl CodexHttpClient {
 
             'attempts: loop {
                 let mut decoder = HttpSseDecoder::default();
+                let mut forwarding_classifier =
+                    super::events::CodexStreamForwardingClassifier::default();
                 let mut body_bytes = 0_u64;
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
@@ -1479,7 +1481,7 @@ impl CodexHttpClient {
                         {
                             quota_failure_hint = super::events::quota_failure_hint(&payload);
                         }
-                        let event_kind = super::events::classify_stream_event(&payload);
+                        let event_kind = forwarding_classifier.classify(&payload);
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
                             && let Some(failure) = failure.as_ref()
@@ -2133,6 +2135,8 @@ impl CodexHttpClient {
             };
 
             let mut pending_events = Vec::new();
+            let mut forwarding_classifier =
+                super::events::CodexStreamForwardingClassifier::default();
             loop {
                 let item = tokio::select! {
                     biased;
@@ -2235,7 +2239,7 @@ impl CodexHttpClient {
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
                 match item {
-                    Ok(payload) => match super::events::classify_stream_event(&payload) {
+                    Ok(payload) => match forwarding_classifier.classify(&payload) {
                         super::events::CodexStreamEventKind::TerminalFailure => {
                             if !forwarded_any {
                                 pending_events.clear();
@@ -3537,6 +3541,127 @@ mod tests {
             terminal.get("type").and_then(|value| value.as_str()),
             Some("response.completed")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_forwards_signature_only_reasoning_before_hosted_search_reset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _request = next_websocket_json(&mut websocket).await;
+            for event in [
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "opaque"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1"}
+                }),
+            ] {
+                websocket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            release_rx.await.unwrap();
+            for event in [
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {"type": "web_search_call", "id": "ws_1"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "action": {"query": "claude-code-proxy"}
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 2,
+                    "delta": "deferred answer"
+                }),
+            ] {
+                websocket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            drop(websocket);
+        });
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_websocket_events_for_owner(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+            )
+            .await
+            .unwrap();
+        let added = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            added
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str),
+            Some("reasoning")
+        );
+        assert_eq!(
+            added.get("type").and_then(serde_json::Value::as_str),
+            Some("response.output_item.added")
+        );
+        let done = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            done.get("type").and_then(serde_json::Value::as_str),
+            Some("response.output_item.done")
+        );
+        assert_eq!(
+            done.pointer("/item/type")
+                .and_then(serde_json::Value::as_str),
+            Some("reasoning")
+        );
+
+        release_tx.send(()).unwrap();
+        let error = loop {
+            let item = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("WebSocket stream must report the forced reset")
+                .expect("WebSocket stream ended without a transport error");
+            match item {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocket);
+        assert_eq!(error.status, 0);
         server.await.unwrap();
     }
 

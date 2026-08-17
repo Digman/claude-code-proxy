@@ -2077,6 +2077,37 @@ mod tests {
         message: &str,
         detail: &str,
     ) {
+        assert_stream_interruption_after_semantic_output_leaves_stream_incomplete(
+            initial_events,
+            Some(client::CodexError {
+                status: 0,
+                message: message.to_string(),
+                detail: Some(detail.to_string()),
+                retry_after: None,
+                origin: client::CodexErrorOrigin::WebSocket,
+            }),
+            message,
+        )
+        .await;
+    }
+
+    async fn assert_eof_after_semantic_output_leaves_stream_incomplete(
+        initial_events: Vec<serde_json::Value>,
+    ) {
+        let message = "Upstream event stream closed before terminal Codex response event";
+        assert_stream_interruption_after_semantic_output_leaves_stream_incomplete(
+            initial_events,
+            None,
+            message,
+        )
+        .await;
+    }
+
+    async fn assert_stream_interruption_after_semantic_output_leaves_stream_incomplete(
+        initial_events: Vec<serde_json::Value>,
+        interruption: Option<client::CodexError>,
+        expected_failure: &str,
+    ) {
         use http_body_util::BodyExt as _;
 
         let body = request_with_tools(serde_json::json!([]));
@@ -2129,15 +2160,9 @@ mod tests {
             .expect("remaining stream must expose an outcome");
         let mut body = response.into_body();
 
-        tx.send(Err(client::CodexError {
-            status: 0,
-            message: message.to_string(),
-            detail: Some(detail.to_string()),
-            retry_after: None,
-            origin: client::CodexErrorOrigin::WebSocket,
-        }))
-        .await
-        .unwrap();
+        if let Some(error) = interruption {
+            tx.send(Err(error)).await.unwrap();
+        }
         drop(tx);
 
         let mut downstream = Vec::new();
@@ -2152,7 +2177,7 @@ mod tests {
         assert!(!downstream.contains("event: error"));
         assert!(!downstream.contains("event: content_block_stop"));
         assert!(!downstream.contains("event: message_stop"));
-        assert_eq!(outcome.failure().as_deref(), Some(message));
+        assert_eq!(outcome.failure().as_deref(), Some(expected_failure));
     }
 
     #[tokio::test]
@@ -2200,6 +2225,188 @@ mod tests {
             websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL,
         )
         .await;
+    }
+
+    fn reasoning_web_search_deferred_events(with_summary: bool) -> Vec<serde_json::Value> {
+        let mut events = vec![serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+        })];
+        if with_summary {
+            events.push(serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "delta": "plan"
+            }));
+        }
+        events.extend([
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "claude-code-proxy"}
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 2,
+                "delta": "deferred answer"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+        ]);
+        events
+    }
+
+    #[tokio::test]
+    async fn transport_failure_during_deferred_web_search_keeps_reasoning_open() {
+        assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+            reasoning_web_search_deferred_events(true),
+            "WebSocket stream error: WebSocket protocol error: Connection reset without closing handshake",
+            websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn eof_during_deferred_web_search_keeps_reasoning_open() {
+        assert_eof_after_semantic_output_leaves_stream_incomplete(
+            reasoning_web_search_deferred_events(true),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transport_failure_during_signature_only_web_search_keeps_reasoning_open() {
+        assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+            reasoning_web_search_deferred_events(false),
+            "WebSocket stream error: WebSocket protocol error: Connection reset without closing handshake",
+            websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn eof_during_signature_only_web_search_keeps_reasoning_open() {
+        assert_eof_after_semantic_output_leaves_stream_incomplete(
+            reasoning_web_search_deferred_events(false),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transport_failure_during_buffered_web_search_retries_before_downstream_output() {
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "buffered-web-search-retry".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        for event in [
+            serde_json::json!({"type": "response.created"}),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "claude-code-proxy"}
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "delta": "deferred answer"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+        ] {
+            tx.send(Ok(event)).await.unwrap();
+        }
+        let message = "WebSocket stream error: connection reset";
+        tx.send(Err(client::CodexError {
+            status: 0,
+            message: message.to_string(),
+            detail: Some(websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+        )
+        .await
+        {
+            LiveStreamStart::Retry { error, .. } => {
+                assert_eq!(error.message, message);
+                assert_eq!(error.origin, client::CodexErrorOrigin::WebSocket);
+            }
+            LiveStreamStart::Response(_) => {
+                panic!("buffered web search must remain retryable before downstream output")
+            }
+        }
     }
 
     #[test]

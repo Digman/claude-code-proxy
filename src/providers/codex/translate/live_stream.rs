@@ -320,14 +320,16 @@ impl LiveStreamTranslator {
                     .capture(item);
             }
             "message" => {
-                self.close_thinking(traffic, out);
+                let deferred = !self.web_searches.is_empty();
+                if !deferred {
+                    self.close_thinking(traffic, out);
+                }
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                     self.item_id_to_output_index
                         .insert(id.to_string(), output_index);
                 }
-                let deferred = !self.web_searches.is_empty();
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Text {
@@ -455,12 +457,10 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
-        self.close_thinking(traffic, out);
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
         if delta.is_empty() {
             return;
         }
-        self.semantic_output_started = true;
 
         let output_index = payload
             .get("output_index")
@@ -473,11 +473,19 @@ impl LiveStreamTranslator {
                     .and_then(|id| self.item_id_to_output_index.get(id).copied())
             })
             .unwrap_or(0);
+        let deferred = match self.blocks_by_output_index.get(&output_index) {
+            Some(LiveBlock::Text { deferred, .. }) => *deferred,
+            Some(LiveBlock::Tool { .. }) => false,
+            None => !self.web_searches.is_empty(),
+        };
+        if !deferred {
+            self.close_thinking(traffic, out);
+            self.semantic_output_started = true;
+        }
 
         if !self.blocks_by_output_index.contains_key(&output_index) {
             let index = self.anthropic_index;
             self.anthropic_index += 1;
-            let deferred = !self.web_searches.is_empty();
             self.blocks_by_output_index.insert(
                 output_index,
                 LiveBlock::Text {
@@ -680,8 +688,6 @@ impl LiveStreamTranslator {
             .and_then(|v| v.as_str())
             == Some("web_search_call")
         {
-            self.close_thinking(traffic, out);
-            self.semantic_output_started = true;
             let item = &payload["item"];
             let index = self.anthropic_index;
             self.anthropic_index += 1;
@@ -802,6 +808,9 @@ impl LiveStreamTranslator {
     }
 
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
+        if !self.web_searches.is_empty() || !self.deferred_text.is_empty() {
+            self.semantic_output_started = true;
+        }
         let searches = std::mem::take(&mut self.web_searches);
         for search in searches {
             self.ensure_message_start(traffic, out);
@@ -1443,6 +1452,16 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!web_search.has_semantic_output());
+        web_search
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
         assert!(web_search.has_semantic_output());
     }
 
@@ -1550,6 +1569,175 @@ mod tests {
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(!rendered.contains("event: error"));
+    }
+
+    #[test]
+    fn empty_text_delta_does_not_close_reasoning() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "delta": "plan"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "delta": ""
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains(r#""type":"thinking_delta""#));
+        assert!(!rendered.contains("event: content_block_stop"));
+    }
+
+    #[test]
+    fn buffers_web_search_and_deferred_text_until_terminal() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        for event in [
+            json!({"type": "response.created"}),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "grok reasoning effort"}
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "delta": "See the official docs."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"type": "message"}
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let buffered = String::from_utf8(out).unwrap();
+        assert!(!translator.has_semantic_output());
+        assert!(!buffered.contains("server_tool_use"));
+        assert!(!buffered.contains("See the official docs."));
+
+        let terminal = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
+        let terminal = String::from_utf8(terminal).unwrap();
+        assert!(translator.has_semantic_output());
+        assert!(terminal.contains("server_tool_use"));
+        assert!(terminal.contains("See the official docs."));
+        assert!(terminal.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn web_search_and_deferred_text_keep_reasoning_open() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "delta": "plan"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "grok reasoning effort"}
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 2,
+                "delta": "See the official docs."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {"type": "message"}
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let before_terminal = String::from_utf8(out).unwrap();
+        assert!(translator.has_semantic_output());
+        assert!(before_terminal.contains(r#""type":"thinking_delta""#));
+        assert!(!before_terminal.contains("event: content_block_stop"));
+        assert!(!before_terminal.contains("See the official docs."));
+
+        let terminal = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
+        let terminal = String::from_utf8(terminal).unwrap();
+        assert!(terminal.contains("event: content_block_stop"));
+        assert!(terminal.contains("server_tool_use"));
+        assert!(terminal.contains("See the official docs."));
+        assert!(terminal.contains("event: message_stop"));
     }
 
     #[test]

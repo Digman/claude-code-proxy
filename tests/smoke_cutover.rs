@@ -197,7 +197,8 @@ where
     addr_str
 }
 
-async fn spawn_truncated_http_upstream(body: &'static [u8]) -> String {
+async fn spawn_truncated_http_upstream(body: impl Into<Vec<u8>>) -> String {
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -212,7 +213,7 @@ async fn spawn_truncated_http_upstream(body: &'static [u8]) -> String {
             body.len() + 4096
         );
         let _ = stream.write_all(headers.as_bytes()).await;
-        let _ = stream.write_all(body).await;
+        let _ = stream.write_all(&body).await;
         let _ = stream.shutdown().await;
     });
 
@@ -255,6 +256,19 @@ async fn spawn_retrying_truncated_http_upstream(
     });
 
     format!("http://{addr}")
+}
+
+fn buffered_web_search_preterminal_body() -> Vec<u8> {
+    concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_search\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"claude-code-proxy\"}}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_search\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"deferred answer\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n\n"
+    )
+    .as_bytes()
+    .to_vec()
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -359,6 +373,55 @@ async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
     assert!(!text.contains("event: error"), "stream body: {text}");
     assert_eq!(text.matches("event: message_start").count(), 1);
     assert_eq!(text.matches("event: message_stop").count(), 1);
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn assert_codex_http_body_error_leaves_stream_incomplete(
+    first_body: Vec<u8>,
+    expected_fragment: &str,
+) -> String {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_truncated_http_upstream(first_body).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed semantic stream must terminate")
+    .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains(expected_fragment), "stream body: {text}");
+    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert!(
+        !text.contains("event: content_block_stop"),
+        "stream body: {text}"
+    );
+    assert!(!text.contains("event: message_stop"), "stream body: {text}");
+    assert!(
+        !text.contains("Transport error reading Codex response body"),
+        "stream body: {text}"
+    );
+    assert!(
+        !text.contains("\"message\":\"http_response_body\""),
+        "stream body: {text}"
+    );
+    text
 }
 
 /// Spawn a mock WebSocket server that accepts one connection, captures the
@@ -1866,6 +1929,18 @@ async fn smoke_codex_http_retries_body_error_after_structural_tool() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_retries_body_error_during_buffered_web_search() {
+    assert_codex_http_retries_structural_body_error(buffered_web_search_preterminal_body()).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_eof_during_buffered_web_search() {
+    assert_codex_http_presemantic_retry(buffered_web_search_preterminal_body()).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_incomplete_after_text_is_an_error() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
@@ -2254,56 +2329,39 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_body_error_after_semantic_output_leaves_stream_incomplete() {
-    let _guard = env_lock();
-    clear_all_continuations_for_tests();
-    let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
-
-    let upstream = spawn_truncated_http_upstream(concat!(
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial before body error\"}\n\n"
-    ).as_bytes())
-    .await;
-
-    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
-    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let response = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"hello"}]
-    }))
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = tokio::time::timeout(
-        Duration::from_secs(2),
-        axum::body::to_bytes(response.into_body(), usize::MAX),
+    assert_codex_http_body_error_leaves_stream_incomplete(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial before body error\"}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        "partial before body error",
     )
-    .await
-    .expect("failed semantic stream must terminate")
-    .unwrap();
-    let text = String::from_utf8_lossy(&body);
-    assert!(
-        text.contains("partial before body error"),
-        "stream body: {text}"
-    );
-    assert!(!text.contains("event: error"), "stream body: {text}");
-    assert!(
-        !text.contains("event: content_block_stop"),
-        "stream body: {text}"
-    );
-    assert!(!text.contains("event: message_stop"), "stream body: {text}");
-    assert!(
-        !text.contains("Transport error reading Codex response body"),
-        "stream body: {text}"
-    );
-    assert!(
-        !text.contains("\"message\":\"http_response_body\""),
-        "stream body: {text}"
-    );
+    .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_signature_only_web_search_error_keeps_thinking_open() {
+    let text = assert_codex_http_body_error_leaves_stream_incomplete(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_signature_search\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"claude-code-proxy\"}}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"message\",\"id\":\"msg_search\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":2,\"delta\":\"deferred answer\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"message\"}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        "signature_delta",
+    )
+    .await;
+    assert!(!text.contains("deferred answer"), "stream body: {text}");
 }
 
 #[allow(clippy::await_holding_lock)]

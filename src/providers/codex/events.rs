@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
 use crate::monitor::{MonitorHandle, ProviderCredits, ProviderQuotaWindow};
+
+use super::translate::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
@@ -19,6 +22,74 @@ pub(crate) enum CodexStreamEventKind {
     Semantic,
     TerminalSuccess,
     TerminalFailure,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CodexStreamForwardingClassifier {
+    buffering_hosted_search_output: bool,
+    reasoning_by_output_index: HashMap<usize, PendingReasoning>,
+}
+
+impl CodexStreamForwardingClassifier {
+    pub(crate) fn classify(&mut self, payload: &Value) -> CodexStreamEventKind {
+        let kind = classify_stream_event(payload);
+        if matches!(
+            kind,
+            CodexStreamEventKind::TerminalSuccess | CodexStreamEventKind::TerminalFailure
+        ) {
+            self.buffering_hosted_search_output = false;
+            self.reasoning_by_output_index.clear();
+            return kind;
+        }
+
+        let event_type = payload.get("type").and_then(Value::as_str);
+        if matches!(
+            event_type,
+            Some("response.output_item.added" | "response.output_item.done")
+        ) && let Some(item) = payload
+            .get("item")
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        {
+            let output_index = payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let pending = self
+                .reasoning_by_output_index
+                .entry(output_index)
+                .or_default();
+            pending.capture(item);
+            if event_type == Some("response.output_item.done") {
+                let emits_signature = pending
+                    .replay()
+                    .and_then(|replay| encode_reasoning_signature(&replay))
+                    .is_some();
+                self.reasoning_by_output_index.remove(&output_index);
+                if emits_signature {
+                    self.buffering_hosted_search_output = false;
+                    self.reasoning_by_output_index.clear();
+                    return CodexStreamEventKind::Semantic;
+                }
+            }
+        }
+
+        let completed_hosted_search = event_type == Some("response.output_item.done")
+            && payload.pointer("/item/type").and_then(Value::as_str) == Some("web_search_call");
+        if completed_hosted_search {
+            self.buffering_hosted_search_output = true;
+            return CodexStreamEventKind::Structural;
+        }
+
+        if self.buffering_hosted_search_output && event_type == Some("response.output_text.delta") {
+            return CodexStreamEventKind::Structural;
+        }
+
+        if kind == CodexStreamEventKind::Semantic {
+            self.buffering_hosted_search_output = false;
+            self.reasoning_by_output_index.clear();
+        }
+        kind
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,6 +683,104 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn forwarding_classifier_commits_signature_only_reasoning() {
+        let mut classifier = CodexStreamForwardingClassifier::default();
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque"
+                }
+            })),
+            CodexStreamEventKind::Structural
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            })),
+            CodexStreamEventKind::Semantic
+        );
+    }
+
+    #[test]
+    fn forwarding_classifier_keeps_unencodable_reasoning_structural() {
+        let mut classifier = CodexStreamForwardingClassifier::default();
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            })),
+            CodexStreamEventKind::Structural
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"}
+            })),
+            CodexStreamEventKind::Structural
+        );
+    }
+
+    #[test]
+    fn forwarding_classifier_buffers_hosted_search_until_terminal() {
+        let mut classifier = CodexStreamForwardingClassifier::default();
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            })),
+            CodexStreamEventKind::Structural
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "deferred answer"
+            })),
+            CodexStreamEventKind::Structural
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.completed",
+                "response": {"status": "completed"}
+            })),
+            CodexStreamEventKind::TerminalSuccess
+        );
+    }
+
+    #[test]
+    fn forwarding_classifier_commits_after_a_recovery_anchor_opens() {
+        let mut classifier = CodexStreamForwardingClassifier::default();
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            })),
+            CodexStreamEventKind::Structural
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "plan"
+            })),
+            CodexStreamEventKind::Semantic
+        );
+        assert_eq!(
+            classifier.classify(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "deferred answer"
+            })),
+            CodexStreamEventKind::Semantic
+        );
     }
 
     #[test]
