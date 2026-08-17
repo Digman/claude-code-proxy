@@ -2053,6 +2053,30 @@ mod tests {
 
     #[tokio::test]
     async fn live_stream_transport_failure_after_semantic_output_leaves_stream_incomplete() {
+        assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+            vec![
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg_up"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "first"
+                }),
+            ],
+            "WebSocket idle timeout after 300000ms",
+            websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL,
+        )
+        .await;
+    }
+
+    async fn assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+        initial_events: Vec<serde_json::Value>,
+        message: &str,
+        detail: &str,
+    ) {
         use http_body_util::BodyExt as _;
 
         let body = request_with_tools(serde_json::json!([]));
@@ -2075,20 +2099,9 @@ mod tests {
             monitor: None,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.send(Ok(serde_json::json!({
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "item": {"type": "message", "id": "msg_up"}
-        })))
-        .await
-        .unwrap();
-        tx.send(Ok(serde_json::json!({
-            "type": "response.output_text.delta",
-            "output_index": 0,
-            "delta": "first"
-        })))
-        .await
-        .unwrap();
+        for event in initial_events {
+            tx.send(Ok(event)).await.unwrap();
+        }
 
         let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
         let continuation = ContinuationReservation::for_owner_turn(None, None);
@@ -2115,13 +2128,11 @@ mod tests {
             .cloned()
             .expect("remaining stream must expose an outcome");
         let mut body = response.into_body();
-        body.frame().await.unwrap().unwrap();
 
-        let message = "WebSocket idle timeout after 300000ms";
         tx.send(Err(client::CodexError {
             status: 0,
             message: message.to_string(),
-            detail: Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            detail: Some(detail.to_string()),
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocket,
         }))
@@ -2137,10 +2148,58 @@ mod tests {
             }
         }
         let downstream = String::from_utf8_lossy(&downstream);
+        assert!(downstream.contains("event: content_block_start"));
         assert!(!downstream.contains("event: error"));
         assert!(!downstream.contains("event: content_block_stop"));
         assert!(!downstream.contains("event: message_stop"));
         assert_eq!(outcome.failure().as_deref(), Some(message));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_completed_reasoning_summary_leaves_stream_incomplete() {
+        assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+            vec![
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+                }),
+                serde_json::json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "plan"
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1"}
+                }),
+            ],
+            "WebSocket stream error: WebSocket protocol error: Connection reset without closing handshake",
+            websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_signature_only_reasoning_leaves_stream_incomplete() {
+        assert_transport_failure_after_semantic_output_leaves_stream_incomplete(
+            vec![
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1"}
+                }),
+            ],
+            "WebSocket stream error: WebSocket protocol error: Connection reset without closing handshake",
+            websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL,
+        )
+        .await;
     }
 
     #[test]

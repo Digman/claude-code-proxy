@@ -665,8 +665,10 @@ impl LiveStreamTranslator {
             let had_active_summary = self
                 .thinking
                 .is_some_and(|thinking| thinking.output_index == output_index);
-            self.close_thinking(traffic, out);
+            // Keep downstream reasoning open until the next block or terminal event so a
+            // transport failure in between remains eligible for Claude Code fallback.
             if !had_active_summary {
+                self.close_thinking(traffic, out);
                 self.emit_signature_only_reasoning(output_index, traffic, out);
             }
             return;
@@ -1027,15 +1029,10 @@ impl LiveStreamTranslator {
                 "delta": {"type": "signature_delta", "signature": signature}
             }),
         );
-        self.emit(
-            traffic,
-            out,
-            "content_block_stop",
-            &serde_json::json!({
-                "type": "content_block_stop",
-                "index": index,
-            }),
-        );
+        self.thinking = Some(LiveThinking {
+            output_index,
+            anthropic_index: index,
+        });
     }
 
     fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -1698,6 +1695,20 @@ mod tests {
 
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains(r#""type":"signature_delta""#));
+        assert!(!out.contains("event: content_block_stop"));
         assert!(translator.has_semantic_output());
+
+        let finished = translator
+            .accept(
+                &json!({
+                    "type":"response.completed",
+                    "response":{"id":"resp_1","usage":{}}
+                }),
+                None,
+            )
+            .unwrap();
+        let finished = String::from_utf8(finished).unwrap();
+        assert!(finished.contains("event: content_block_stop"));
+        assert!(finished.contains("event: message_stop"));
     }
 }
