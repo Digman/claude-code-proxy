@@ -62,8 +62,26 @@ const WEBSOCKET_KEEPALIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 pub type CodexWebSocketEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLiveTransport {
+    Http,
+    WebSocket,
+    Unknown,
+}
+
+impl CodexLiveTransport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::WebSocket => "websocket",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 pub(crate) struct CodexWebSocketEventStream {
     receiver: CodexWebSocketEventReceiver,
+    actual_transport: CodexLiveTransport,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     response_timeout_retry: Arc<AtomicBool>,
@@ -79,8 +97,16 @@ pub(crate) struct CodexWebSocketSocketIdPublisher {
 }
 
 impl CodexWebSocketEventStream {
+    #[cfg(test)]
     pub(crate) fn pending(
         receiver: CodexWebSocketEventReceiver,
+    ) -> (Self, CodexWebSocketSocketIdPublisher) {
+        Self::pending_with_transport(receiver, CodexLiveTransport::Unknown)
+    }
+
+    pub(crate) fn pending_with_transport(
+        receiver: CodexWebSocketEventReceiver,
+        actual_transport: CodexLiveTransport,
     ) -> (Self, CodexWebSocketSocketIdPublisher) {
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
@@ -89,6 +115,7 @@ impl CodexWebSocketEventStream {
         (
             Self {
                 receiver,
+                actual_transport,
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
                 response_timeout_retry: response_timeout_retry.clone(),
@@ -101,6 +128,10 @@ impl CodexWebSocketEventStream {
                 provider_retry_handoff,
             },
         )
+    }
+
+    pub(crate) fn actual_transport(&self) -> CodexLiveTransport {
+        self.actual_transport
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
@@ -1065,7 +1096,8 @@ pub(super) fn start_codex_websocket_events(
         );
     }
     let (tx, rx) = mpsc::channel(64);
-    let (receiver, socket_id_publisher) = CodexWebSocketEventStream::pending(rx);
+    let (receiver, socket_id_publisher) =
+        CodexWebSocketEventStream::pending_with_transport(rx, CodexLiveTransport::WebSocket);
     tokio::spawn(async move {
         let ReadyWebSocket {
             ws_url: _,
@@ -2462,6 +2494,15 @@ mod tests {
         );
         assert!(error.message.contains(message));
         assert!(is_stream_transport_error(&error));
+    }
+
+    #[test]
+    fn event_stream_reports_its_actual_transport() {
+        let (_tx, rx) = mpsc::channel(1);
+        let (stream, _) =
+            CodexWebSocketEventStream::pending_with_transport(rx, CodexLiveTransport::Http);
+
+        assert_eq!(stream.actual_transport(), CodexLiveTransport::Http);
     }
 
     #[test]

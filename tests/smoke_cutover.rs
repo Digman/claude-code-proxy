@@ -376,7 +376,7 @@ async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn assert_codex_http_body_error_leaves_stream_incomplete(
+async fn assert_codex_http_body_error_surfaces_downstream(
     first_body: Vec<u8>,
     expected_fragment: &str,
 ) -> String {
@@ -398,21 +398,39 @@ async fn assert_codex_http_body_error_leaves_stream_incomplete(
     .await;
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body = tokio::time::timeout(
-        Duration::from_secs(2),
-        axum::body::to_bytes(response.into_body(), usize::MAX),
-    )
+    let mut body = response.into_body();
+    let (body_bytes, body_error) = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut body_bytes = Vec::new();
+        let mut body_error = None;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        body_bytes.extend_from_slice(&data);
+                    }
+                }
+                Err(error) => {
+                    assert!(
+                        body_error.is_none(),
+                        "stream emitted more than one body error"
+                    );
+                    body_error = Some(error.to_string());
+                }
+            }
+        }
+        (body_bytes, body_error)
+    })
     .await
-    .expect("failed semantic stream must terminate")
-    .unwrap();
-    let text = String::from_utf8(body.to_vec()).unwrap();
+    .expect("failed semantic stream must terminate");
+    let text = String::from_utf8(body_bytes).unwrap();
+    let body_error = body_error.expect("truncated upstream must surface a downstream body error");
     assert!(text.contains(expected_fragment), "stream body: {text}");
     assert!(!text.contains("event: error"), "stream body: {text}");
-    assert!(
-        !text.contains("event: content_block_stop"),
-        "stream body: {text}"
-    );
     assert!(!text.contains("event: message_stop"), "stream body: {text}");
+    assert!(
+        body_error.contains("Transport error reading Codex response body"),
+        "body error: {body_error}"
+    );
     assert!(
         !text.contains("Transport error reading Codex response body"),
         "stream body: {text}"
@@ -2328,8 +2346,8 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_body_error_after_semantic_output_leaves_stream_incomplete() {
-    assert_codex_http_body_error_leaves_stream_incomplete(
+async fn smoke_codex_http_body_error_after_semantic_output_surfaces_downstream() {
+    let text = assert_codex_http_body_error_surfaces_downstream(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
@@ -2340,12 +2358,16 @@ async fn smoke_codex_http_body_error_after_semantic_output_leaves_stream_incompl
         "partial before body error",
     )
     .await;
+    assert!(
+        !text.contains("event: content_block_stop"),
+        "stream body: {text}"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_signature_only_web_search_error_keeps_thinking_open() {
-    let text = assert_codex_http_body_error_leaves_stream_incomplete(
+    let text = assert_codex_http_body_error_surfaces_downstream(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_signature_search\"}}\n\n",
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\"}}\n\n",
@@ -2362,54 +2384,31 @@ async fn smoke_codex_http_signature_only_web_search_error_keeps_thinking_open() 
     )
     .await;
     assert!(!text.contains("deferred answer"), "stream body: {text}");
+    assert!(
+        !text.contains("event: content_block_stop"),
+        "stream body: {text}"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_body_error_after_closed_text_is_explicit() {
-    let _guard = env_lock();
-    clear_all_continuations_for_tests();
-    let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
-
-    let upstream = spawn_truncated_http_upstream(concat!(
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_closed_text\"}}\n\n",
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"closed before body error\"}\n\n",
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n"
-    ).as_bytes())
-    .await;
-
-    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
-    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let response = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"hello"}]
-    }))
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = tokio::time::timeout(
-        Duration::from_secs(2),
-        axum::body::to_bytes(response.into_body(), usize::MAX),
+async fn smoke_codex_http_body_error_after_closed_text_surfaces_downstream() {
+    let text = assert_codex_http_body_error_surfaces_downstream(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_closed_text\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"closed before body error\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_closed_text\"}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        "closed before body error",
     )
-    .await
-    .expect("closed semantic stream must terminate")
-    .unwrap();
-    let text = String::from_utf8_lossy(&body);
-    assert!(
-        text.contains("closed before body error"),
-        "stream body: {text}"
-    );
+    .await;
     assert!(
         text.contains("event: content_block_stop"),
         "stream body: {text}"
     );
-    assert!(text.contains("event: error"), "stream body: {text}");
-    assert!(!text.contains("event: message_stop"), "stream body: {text}");
 }
 
 #[allow(clippy::await_holding_lock)]

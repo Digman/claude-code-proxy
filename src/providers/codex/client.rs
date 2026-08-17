@@ -375,6 +375,7 @@ struct HttpEventStreamState {
     auth: StoredAuth,
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
+    configured_transport: crate::config::CodexTransport,
     retries: u32,
 }
 
@@ -514,6 +515,34 @@ const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
+
+fn http_stream_retry_telemetry(
+    configured_transport: crate::config::CodexTransport,
+) -> super::LiveRetryTelemetry {
+    super::LiveRetryTelemetry {
+        route: super::LiveRecoveryRoute {
+            configured_transport,
+            actual_transport: super::websocket::CodexLiveTransport::Http,
+        },
+        attempt_scope: "http_stream",
+        max_attempts: MAX_BUFFERED_TRANSPORT_ATTEMPTS,
+        timeout_retries_used: None,
+    }
+}
+
+fn websocket_continuation_retry_telemetry(
+    configured_transport: crate::config::CodexTransport,
+) -> super::LiveRetryTelemetry {
+    super::LiveRetryTelemetry {
+        route: super::LiveRecoveryRoute {
+            configured_transport,
+            actual_transport: super::websocket::CodexLiveTransport::WebSocket,
+        },
+        attempt_scope: "websocket_continuation",
+        max_attempts: 2,
+        timeout_retries_used: None,
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ProxyEnvironment {
@@ -1127,6 +1156,20 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
+        self.stream_codex_http_events_with_configured_transport(
+            body,
+            ctx,
+            crate::config::CodexTransport::Http,
+        )
+        .await
+    }
+
+    async fn stream_codex_http_events_with_configured_transport(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        configured_transport: crate::config::CodexTransport,
+    ) -> Result<CodexHttpEventReceiver, CodexError> {
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1158,12 +1201,33 @@ impl CodexHttpClient {
                 Ok(attempt) => break attempt,
                 Err(error) if retryable_http_stream_error(&error) => {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        super::log_live_transport_retry_exhausted(
+                            ctx,
+                            &error,
+                            http_stream_retry_telemetry(configured_transport),
+                            retries + 1,
+                            "retry_limit",
+                        );
                         return Err(error);
                     }
                     let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
                     if delay.exceeds_budget {
+                        super::log_live_transport_retry_exhausted(
+                            ctx,
+                            &error,
+                            http_stream_retry_telemetry(configured_transport),
+                            retries + 1,
+                            "backoff_budget",
+                        );
                         return Err(error);
                     }
+                    super::log_live_transport_retry(
+                        ctx,
+                        &error,
+                        http_stream_retry_telemetry(configured_transport),
+                        retries + 1,
+                        delay.wait_ms,
+                    );
                     retries += 1;
                     sleep(delay.wait_ms).await;
                 }
@@ -1179,6 +1243,7 @@ impl CodexHttpClient {
                 auth,
                 auth_refresh_attempted,
                 use_responses_lite,
+                configured_transport,
                 retries,
             },
             ctx.clone(),
@@ -1189,9 +1254,15 @@ impl CodexHttpClient {
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
+        configured_transport: crate::config::CodexTransport,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let receiver = self.stream_codex_http_events(body, ctx).await?;
-        let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
+        let receiver = self
+            .stream_codex_http_events_with_configured_transport(body, ctx, configured_transport)
+            .await?;
+        let (stream, _) = super::websocket::CodexWebSocketEventStream::pending_with_transport(
+            receiver,
+            super::websocket::CodexLiveTransport::Http,
+        );
         Ok(stream)
     }
 
@@ -1259,11 +1330,21 @@ impl CodexHttpClient {
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_codex_websocket_events_for_owner(
+                body,
+                ctx,
+                continuation,
+                crate::config::CodexTransport::Auto,
+            )
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
-                self.stream_codex_http_events_for_owner(body, ctx).await
+                self.stream_codex_http_events_for_owner(
+                    body,
+                    ctx,
+                    crate::config::CodexTransport::Auto,
+                )
+                .await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -1297,6 +1378,7 @@ impl CodexHttpClient {
             mut auth,
             mut auth_refresh_attempted,
             use_responses_lite,
+            configured_transport,
             mut retries,
         } = state;
         let client = self.clone();
@@ -1558,14 +1640,35 @@ impl CodexHttpClient {
 
                 loop {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        super::log_live_transport_retry_exhausted(
+                            &ctx,
+                            &retry_error,
+                            http_stream_retry_telemetry(configured_transport),
+                            retries + 1,
+                            "retry_limit",
+                        );
                         let _ = tx.send(Err(retry_error)).await;
                         return;
                     }
                     let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
                     if delay.exceeds_budget {
+                        super::log_live_transport_retry_exhausted(
+                            &ctx,
+                            &retry_error,
+                            http_stream_retry_telemetry(configured_transport),
+                            retries + 1,
+                            "backoff_budget",
+                        );
                         let _ = tx.send(Err(retry_error)).await;
                         return;
                     }
+                    super::log_live_transport_retry(
+                        &ctx,
+                        &retry_error,
+                        http_stream_retry_telemetry(configured_transport),
+                        retries + 1,
+                        delay.wait_ms,
+                    );
                     retries += 1;
                     tokio::select! {
                         _ = tx.closed() => return,
@@ -1972,9 +2075,14 @@ impl CodexHttpClient {
     ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
         let reservation =
             continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
-        self.stream_codex_websocket_events_for_owner(body, ctx, reservation.as_ref())
-            .await
-            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
+        self.stream_codex_websocket_events_for_owner(
+            body,
+            ctx,
+            reservation.as_ref(),
+            crate::config::CodexTransport::WebSocket,
+        )
+        .await
+        .map(super::websocket::CodexWebSocketEventStream::into_receiver)
     }
 
     pub(crate) async fn stream_codex_websocket_events_for_owner(
@@ -1982,6 +2090,7 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
+        configured_transport: crate::config::CodexTransport,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -2003,7 +2112,11 @@ impl CodexHttpClient {
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
+        let (rx, socket_id_publisher) =
+            super::websocket::CodexWebSocketEventStream::pending_with_transport(
+                rx,
+                super::websocket::CodexLiveTransport::WebSocket,
+            );
         tokio::spawn(async move {
             client
                 .coordinate_live_websocket_events(
@@ -2013,6 +2126,7 @@ impl CodexHttpClient {
                     auth,
                     tx,
                     socket_id_publisher,
+                    configured_transport,
                 )
                 .await;
         });
@@ -2029,6 +2143,7 @@ impl CodexHttpClient {
         mut auth: StoredAuth,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
+        configured_transport: crate::config::CodexTransport,
     ) {
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
@@ -2114,6 +2229,15 @@ impl CodexHttpClient {
                         continue 'attempt;
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
+                        if super::retryable_live_start_codex_error(&err) {
+                            super::log_live_transport_retry(
+                                &ctx,
+                                &err,
+                                websocket_continuation_retry_telemetry(configured_transport),
+                                1,
+                                0,
+                            );
+                        }
                         socket_id_publisher.mark_full_context_retry();
                         if super::websocket::is_response_timeout_error(&err) {
                             socket_id_publisher.mark_response_timeout_retry();
@@ -2227,6 +2351,15 @@ impl CodexHttpClient {
                     && is_continuation_retry_error(err)
                     && !forwarded_any
                 {
+                    if super::retryable_live_start_codex_error(err) {
+                        super::log_live_transport_retry(
+                            &ctx,
+                            err,
+                            websocket_continuation_retry_telemetry(configured_transport),
+                            1,
+                            0,
+                        );
+                    }
                     socket_id_publisher.mark_full_context_retry();
                     if super::websocket::is_response_timeout_error(err) {
                         socket_id_publisher.mark_response_timeout_retry();
@@ -2852,7 +2985,7 @@ fn should_retry_codex_status(status: u16) -> bool {
     should_retry_status(status) || status == 529
 }
 
-fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
+pub(super) fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
     match origin {
         CodexErrorOrigin::Http => "http",
         CodexErrorOrigin::WebSocket => "websocket",
@@ -3616,6 +3749,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 None,
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();
@@ -4171,6 +4305,7 @@ mod tests {
                 &second_request,
                 &context,
                 Some(&second_candidate),
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();
@@ -4248,6 +4383,7 @@ mod tests {
                 &request,
                 &http_test_context(),
                 Some(&continuation),
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();
@@ -4371,6 +4507,7 @@ mod tests {
                 &request,
                 &http_test_context(),
                 Some(&continuation),
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();
@@ -4424,6 +4561,7 @@ mod tests {
             &request,
             &http_test_context(),
             Some(&continuation),
+            crate::config::CodexTransport::WebSocket,
         )
         .await
         .unwrap();
@@ -4476,6 +4614,7 @@ mod tests {
             &request,
             &http_test_context(),
             Some(&continuation),
+            crate::config::CodexTransport::WebSocket,
         )
         .await
         .unwrap();
@@ -4537,6 +4676,7 @@ mod tests {
                 &request,
                 &http_test_context(),
                 Some(&continuation),
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();
@@ -4553,6 +4693,7 @@ mod tests {
                 &request,
                 &http_test_context(),
                 Some(&continuation),
+                crate::config::CodexTransport::WebSocket,
             )
             .await
             .unwrap();

@@ -633,6 +633,214 @@ fn log_compaction_event(
     }
 }
 
+fn live_recovery_error_kind(error: &client::CodexError) -> &'static str {
+    match error.detail.as_deref() {
+        Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL) => return "keepalive_failure",
+        Some(websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+        | Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL) => return "timeout",
+        Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL) => return "premature_eof",
+        Some(EMPTY_CODEX_COMPLETION_DETAIL) => return "empty_completion",
+        _ => {}
+    }
+
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("connection reset")
+        || message.contains("econnreset")
+        || message.contains("without closing handshake")
+    {
+        return "connection_reset";
+    }
+    if message.contains("broken pipe") {
+        return "broken_pipe";
+    }
+    if message.contains("timed out") || message.contains("timeout") {
+        return "timeout";
+    }
+    if message.contains("unexpected eof")
+        || message.contains("close_notify")
+        || message.contains("closed before terminal")
+        || message.contains("ended before a terminal")
+    {
+        return "premature_eof";
+    }
+
+    match error.detail.as_deref() {
+        Some("http_response_body") => "premature_eof",
+        Some("http_response_sse") if message.contains("incomplete frame") => "premature_eof",
+        Some("http_response_sse") => "protocol_error",
+        _ if error.status == 429 => "rate_limited",
+        _ if error.status >= 500 => "upstream_error",
+        _ => "transport_error",
+    }
+}
+
+fn actual_transport_from_error(error: &client::CodexError) -> websocket::CodexLiveTransport {
+    match error.origin {
+        client::CodexErrorOrigin::Http | client::CodexErrorOrigin::BufferedHttp => {
+            websocket::CodexLiveTransport::Http
+        }
+        client::CodexErrorOrigin::WebSocket
+        | client::CodexErrorOrigin::WebSocketHandshake
+        | client::CodexErrorOrigin::BufferedWebSocket => websocket::CodexLiveTransport::WebSocket,
+        client::CodexErrorOrigin::Auth => websocket::CodexLiveTransport::Unknown,
+    }
+}
+
+fn live_transport_error_origin(
+    actual_transport: websocket::CodexLiveTransport,
+) -> client::CodexErrorOrigin {
+    match actual_transport {
+        websocket::CodexLiveTransport::Http => client::CodexErrorOrigin::Http,
+        websocket::CodexLiveTransport::WebSocket | websocket::CodexLiveTransport::Unknown => {
+            client::CodexErrorOrigin::WebSocket
+        }
+    }
+}
+
+fn premature_live_stream_end_error(
+    actual_transport: websocket::CodexLiveTransport,
+) -> client::CodexError {
+    client::CodexError {
+        status: 0,
+        message: "Upstream event stream closed before terminal Codex response event".to_string(),
+        detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
+        retry_after: None,
+        origin: live_transport_error_origin(actual_transport),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LiveRecoveryRoute {
+    configured_transport: config::CodexTransport,
+    actual_transport: websocket::CodexLiveTransport,
+}
+
+#[derive(Clone, Copy)]
+struct LiveRetryTelemetry {
+    route: LiveRecoveryRoute,
+    attempt_scope: &'static str,
+    max_attempts: u32,
+    timeout_retries_used: Option<u32>,
+}
+
+fn provider_retry_telemetry(
+    configured_transport: config::CodexTransport,
+    actual_transport: websocket::CodexLiveTransport,
+    timeout_retries_used: u32,
+) -> LiveRetryTelemetry {
+    LiveRetryTelemetry {
+        route: LiveRecoveryRoute {
+            configured_transport,
+            actual_transport,
+        },
+        attempt_scope: "provider",
+        max_attempts: MAX_RETRYABLE_LIVE_STREAM_RETRIES + 1,
+        timeout_retries_used: Some(timeout_retries_used),
+    }
+}
+
+fn live_recovery_fields(
+    ctx: &RequestContext,
+    route: LiveRecoveryRoute,
+    recovery_phase: &str,
+    error: &client::CodexError,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+        (
+            "configuredTransport".to_string(),
+            serde_json::json!(route.configured_transport.as_str()),
+        ),
+        (
+            "actualTransport".to_string(),
+            serde_json::json!(route.actual_transport.as_str()),
+        ),
+        (
+            "errorOrigin".to_string(),
+            serde_json::json!(client::codex_error_origin_name(error.origin)),
+        ),
+        (
+            "recoveryPhase".to_string(),
+            serde_json::json!(recovery_phase),
+        ),
+        ("status".to_string(), serde_json::json!(error.status)),
+        (
+            "errorKind".to_string(),
+            serde_json::json!(live_recovery_error_kind(error)),
+        ),
+    ])
+}
+
+fn add_retry_policy_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    telemetry: LiveRetryTelemetry,
+) {
+    fields.insert(
+        "attemptScope".into(),
+        serde_json::json!(telemetry.attempt_scope),
+    );
+    fields.insert(
+        "maxAttempts".into(),
+        serde_json::json!(telemetry.max_attempts),
+    );
+    if let Some(timeout_retries_used) = telemetry.timeout_retries_used {
+        fields.insert(
+            "timeoutRetriesUsed".into(),
+            serde_json::json!(timeout_retries_used),
+        );
+        fields.insert(
+            "maxTimeoutRetries".into(),
+            serde_json::json!(MAX_RESPONSE_TIMEOUT_RETRIES),
+        );
+    }
+}
+
+fn log_live_transport_retry(
+    ctx: &RequestContext,
+    error: &client::CodexError,
+    telemetry: LiveRetryTelemetry,
+    failed_attempt: u32,
+    delay_ms: u64,
+) {
+    let mut fields = live_recovery_fields(ctx, telemetry.route, "pre_output", error);
+    add_retry_policy_fields(&mut fields, telemetry);
+    fields.insert("failedAttempt".into(), serde_json::json!(failed_attempt));
+    fields.insert("nextAttempt".into(), serde_json::json!(failed_attempt + 1));
+    fields.insert("delayMs".into(), serde_json::json!(delay_ms));
+    create_logger("codex").info("live_transport_retry", Some(fields));
+}
+
+fn log_live_transport_retry_exhausted(
+    ctx: &RequestContext,
+    error: &client::CodexError,
+    telemetry: LiveRetryTelemetry,
+    attempts: u32,
+    exhausted_reason: &str,
+) {
+    let mut fields = live_recovery_fields(ctx, telemetry.route, "pre_output", error);
+    add_retry_policy_fields(&mut fields, telemetry);
+    fields.insert("attempts".into(), serde_json::json!(attempts));
+    fields.insert(
+        "exhaustedReason".into(),
+        serde_json::json!(exhausted_reason),
+    );
+    create_logger("codex").warn("live_transport_retry_exhausted", Some(fields));
+}
+
+fn log_live_client_retry_handoff(
+    ctx: &RequestContext,
+    route: LiveRecoveryRoute,
+    open_content_blocks: usize,
+    error: &client::CodexError,
+) {
+    let mut fields = live_recovery_fields(ctx, route, "post_output", error);
+    fields.insert(
+        "openContentBlocks".into(),
+        serde_json::json!(open_content_blocks),
+    );
+    create_logger("codex").info("live_client_retry_handoff", Some(fields));
+}
+
 fn abort_request_state(
     session_id: Option<&str>,
     continuation: &ContinuationReservation,
@@ -695,6 +903,7 @@ enum LiveStreamStart {
     Response(Response),
     Retry {
         error: client::CodexError,
+        actual_transport: websocket::CodexLiveTransport,
         full_context_retry_attempted: bool,
         response_timeout_retry_attempted: bool,
     },
@@ -732,7 +941,7 @@ async fn live_stream_response(
         let upstream_events = match transport {
             config::CodexTransport::Http => {
                 client
-                    .stream_codex_http_events_for_owner(&request_body, &ctx)
+                    .stream_codex_http_events_for_owner(&request_body, &ctx, transport)
                     .await
             }
             config::CodexTransport::WebSocket => {
@@ -741,6 +950,7 @@ async fn live_stream_response(
                         &request_body,
                         &ctx,
                         continuation.as_ref(),
+                        transport,
                     )
                     .await
             }
@@ -763,6 +973,24 @@ async fn live_stream_response(
                     continue;
                 }
                 if live_retry_limit_reached(&err, attempt, response_timeout_retries) {
+                    let exhausted_reason = if is_websocket_response_timeout(&err)
+                        && response_timeout_retries >= MAX_RESPONSE_TIMEOUT_RETRIES
+                    {
+                        "response_timeout_limit"
+                    } else {
+                        "retry_limit"
+                    };
+                    log_live_transport_retry_exhausted(
+                        &ctx,
+                        &err,
+                        provider_retry_telemetry(
+                            transport,
+                            actual_transport_from_error(&err),
+                            response_timeout_retries,
+                        ),
+                        attempt + 1,
+                        exhausted_reason,
+                    );
                     cleanup.abort();
                     return map_codex_error_to_response(&err);
                 }
@@ -771,9 +999,31 @@ async fn live_stream_response(
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
+                    log_live_transport_retry_exhausted(
+                        &ctx,
+                        &err,
+                        provider_retry_telemetry(
+                            transport,
+                            actual_transport_from_error(&err),
+                            response_timeout_retries,
+                        ),
+                        attempt + 1,
+                        "backoff_budget",
+                    );
                     cleanup.abort();
                     return map_codex_error_to_response(&err);
                 }
+                log_live_transport_retry(
+                    &ctx,
+                    &err,
+                    provider_retry_telemetry(
+                        transport,
+                        actual_transport_from_error(&err),
+                        response_timeout_retries,
+                    ),
+                    attempt + 1,
+                    delay.wait_ms,
+                );
                 attempt += 1;
                 sleep(delay.wait_ms).await;
                 continue;
@@ -792,6 +1042,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            transport,
         )
         .await
         {
@@ -801,6 +1052,7 @@ async fn live_stream_response(
             }
             LiveStreamStart::Retry {
                 error,
+                actual_transport,
                 full_context_retry_attempted,
                 response_timeout_retry_attempted,
             } => {
@@ -808,12 +1060,29 @@ async fn live_stream_response(
                 // pre-semantic retries so it can stop immediately when the
                 // consumer disappears. Do not multiply that exhausted retry
                 // loop by the provider-level WebSocket retry policy.
-                if error.origin == client::CodexErrorOrigin::Http {
+                if error.origin == client::CodexErrorOrigin::Http
+                    && error.detail.as_deref() != Some(EMPTY_CODEX_COMPLETION_DETAIL)
+                {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
+                    log_live_transport_retry_exhausted(
+                        &ctx,
+                        &error,
+                        LiveRetryTelemetry {
+                            route: LiveRecoveryRoute {
+                                configured_transport: transport,
+                                actual_transport,
+                            },
+                            attempt_scope: "websocket_continuation",
+                            max_attempts: 2,
+                            timeout_retries_used: Some(u32::from(response_timeout_retry_attempted)),
+                        },
+                        2,
+                        "continuation_retry_limit",
+                    );
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -825,6 +1094,24 @@ async fn live_stream_response(
                     response_timeout_retries = response_timeout_retries.max(1);
                 }
                 if live_retry_limit_reached(&error, attempt, response_timeout_retries) {
+                    let exhausted_reason = if is_websocket_response_timeout(&error)
+                        && response_timeout_retries >= MAX_RESPONSE_TIMEOUT_RETRIES
+                    {
+                        "response_timeout_limit"
+                    } else {
+                        "retry_limit"
+                    };
+                    log_live_transport_retry_exhausted(
+                        &ctx,
+                        &error,
+                        provider_retry_telemetry(
+                            transport,
+                            actual_transport,
+                            response_timeout_retries,
+                        ),
+                        attempt + 1,
+                        exhausted_reason,
+                    );
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -833,9 +1120,27 @@ async fn live_stream_response(
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
+                    log_live_transport_retry_exhausted(
+                        &ctx,
+                        &error,
+                        provider_retry_telemetry(
+                            transport,
+                            actual_transport,
+                            response_timeout_retries,
+                        ),
+                        attempt + 1,
+                        "backoff_budget",
+                    );
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
+                log_live_transport_retry(
+                    &ctx,
+                    &error,
+                    provider_retry_telemetry(transport, actual_transport, response_timeout_retries),
+                    attempt + 1,
+                    delay.wait_ms,
+                );
                 attempt += 1;
                 sleep(delay.wait_ms).await;
             }
@@ -847,11 +1152,13 @@ fn provider_retry(
     upstream_events: &websocket::CodexWebSocketEventStream,
     error: client::CodexError,
 ) -> LiveStreamStart {
+    let actual_transport = upstream_events.actual_transport();
     let full_context_retry_attempted = upstream_events.used_full_context_retry();
     let response_timeout_retry_attempted = upstream_events.used_response_timeout_retry();
     upstream_events.mark_provider_retry_handoff();
     LiveStreamStart::Retry {
         error,
+        actual_transport,
         full_context_retry_attempted,
         response_timeout_retry_attempted,
     }
@@ -866,6 +1173,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    transport: config::CodexTransport,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -937,7 +1245,10 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
-            return provider_retry(&upstream_events, empty_live_completion_error());
+            return provider_retry(
+                &upstream_events,
+                empty_live_completion_error(upstream_events.actual_transport()),
+            );
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -963,6 +1274,7 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compaction,
+                transport,
             ));
         }
         if terminal {
@@ -996,13 +1308,15 @@ async fn live_stream_response_once(
     )
 }
 
-fn empty_live_completion_error() -> client::CodexError {
+fn empty_live_completion_error(
+    actual_transport: websocket::CodexLiveTransport,
+) -> client::CodexError {
     client::CodexError {
         status: 503,
         message: "Codex completed without producing output".to_string(),
         detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
         retry_after: None,
-        origin: client::CodexErrorOrigin::WebSocket,
+        origin: live_transport_error_origin(actual_transport),
     }
 }
 
@@ -1084,6 +1398,7 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
+    transport: config::CodexTransport,
 ) -> Response {
     let outcome = ResponseOutcome::default();
     let task_outcome = outcome.clone();
@@ -1209,7 +1524,22 @@ fn remaining_live_stream_response(
                     let error_type = codex_stream_error_type(&err);
                     let error_message = codex_error_message(&err);
                     task_outcome.fail(error_message.to_string());
-                    if open_content_blocks > 0 && post_output_stream_interrupted(&err) {
+                    if post_output_stream_interrupted(&err) {
+                        log_live_client_retry_handoff(
+                            &ctx,
+                            LiveRecoveryRoute {
+                                configured_transport: transport,
+                                actual_transport: upstream_events.actual_transport(),
+                            },
+                            open_content_blocks,
+                            &err,
+                        );
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                error_message.to_string(),
+                            )))
+                            .await;
                         return;
                     }
                     let chunk =
@@ -1234,16 +1564,24 @@ fn remaining_live_stream_response(
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
             return;
         }
-        let error_message = "Upstream event stream closed before terminal Codex response event";
-        task_outcome.fail(error_message.to_string());
-        if open_content_blocks > 0 {
-            return;
-        }
-        let chunk = translator.error_chunk(error_message, "api_error", ctx.traffic.as_deref());
-        if !chunk.is_empty() {
-            record_live_stream_progress(&ctx, &chunk);
-            let _ = tx.send(Ok(Bytes::from(chunk))).await;
-        }
+        let actual_transport = upstream_events.actual_transport();
+        let error = premature_live_stream_end_error(actual_transport);
+        task_outcome.fail(error.message.clone());
+        log_live_client_retry_handoff(
+            &ctx,
+            LiveRecoveryRoute {
+                configured_transport: transport,
+                actual_transport,
+            },
+            open_content_blocks,
+            &error,
+        );
+        let _ = tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                error.message,
+            )))
+            .await;
     });
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
@@ -1987,6 +2325,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::WebSocket,
         )
         .await
         {
@@ -2147,6 +2486,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::WebSocket,
         )
         .await
         {
@@ -2166,18 +2506,139 @@ mod tests {
         drop(tx);
 
         let mut downstream = Vec::new();
+        let mut body_error = None;
         while let Some(frame) = body.frame().await {
-            let frame = frame.unwrap();
-            if let Ok(data) = frame.into_data() {
-                downstream.extend_from_slice(&data);
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        downstream.extend_from_slice(&data);
+                    }
+                }
+                Err(error) => {
+                    assert!(
+                        body_error.is_none(),
+                        "stream emitted more than one body error"
+                    );
+                    body_error = Some(error.to_string());
+                }
             }
         }
         let downstream = String::from_utf8_lossy(&downstream);
         assert!(downstream.contains("event: content_block_start"));
         assert!(!downstream.contains("event: error"));
-        assert!(!downstream.contains("event: content_block_stop"));
+        assert!(
+            downstream.matches("event: content_block_start").count()
+                > downstream.matches("event: content_block_stop").count(),
+            "at least one content block must remain open at the transport boundary"
+        );
         assert!(!downstream.contains("event: message_stop"));
+        assert!(
+            body_error
+                .as_deref()
+                .is_some_and(|message| message.contains(expected_failure)),
+            "stream must surface the upstream interruption as a body error: {body_error:?}"
+        );
         assert_eq!(outcome.failure().as_deref(), Some(expected_failure));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_completed_tool_call_finishes_without_body_error() {
+        use http_body_util::BodyExt as _;
+
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "completed-tool-stream-interruption".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"command\":\"pwd\"}"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }
+            }),
+        ] {
+            tx.send(Ok(event)).await.unwrap();
+        }
+
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let response = match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            ContinuationReservation::for_owner_turn(None, None),
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => panic!("unexpected retry: {error}"),
+        };
+        let outcome = response
+            .extensions()
+            .get::<ResponseOutcome>()
+            .cloned()
+            .expect("remaining stream must expose an outcome");
+        let mut body = response.into_body();
+        tx.send(Err(client::CodexError {
+            status: 0,
+            message: "WebSocket stream error: connection reset".to_string(),
+            detail: Some(websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut downstream = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("a completed tool call must close as a valid SSE stream");
+            if let Ok(data) = frame.into_data() {
+                downstream.extend_from_slice(&data);
+            }
+        }
+        let downstream = String::from_utf8_lossy(&downstream);
+        assert!(downstream.contains(r#""type":"tool_use""#));
+        assert!(downstream.contains(r#""stop_reason":"tool_use""#));
+        assert!(downstream.contains("event: message_stop"));
+        assert!(!downstream.contains("event: error"));
+        assert_eq!(outcome.failure(), None);
     }
 
     #[tokio::test]
@@ -2198,6 +2659,21 @@ mod tests {
                     "type": "response.output_item.done",
                     "output_index": 0,
                     "item": {"type": "reasoning", "id": "rs_1"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {"type": "reasoning", "id": "rs_2", "encrypted_content": "opaque-2"}
+                }),
+                serde_json::json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 1,
+                    "delta": "verify"
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {"type": "reasoning", "id": "rs_2"}
                 }),
             ],
             "WebSocket stream error: WebSocket protocol error: Connection reset without closing handshake",
@@ -2396,6 +2872,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::WebSocket,
         )
         .await
         {
@@ -2498,10 +2975,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_live_completion_maps_to_explicit_service_unavailable() {
-        let err = empty_live_completion_error();
+        let err = empty_live_completion_error(websocket::CodexLiveTransport::WebSocket);
 
         assert_eq!(err.status, 503);
         assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+        assert_eq!(err.origin, client::CodexErrorOrigin::WebSocket);
         assert_eq!(
             map_codex_error_to_response(&err).status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -2531,6 +3009,25 @@ mod tests {
                 MAX_RESPONSE_TIMEOUT_RETRIES
             ));
         }
+    }
+
+    #[test]
+    fn provider_retry_telemetry_keeps_global_and_timeout_budgets_distinct() {
+        let telemetry = provider_retry_telemetry(
+            config::CodexTransport::Auto,
+            websocket::CodexLiveTransport::WebSocket,
+            MAX_RESPONSE_TIMEOUT_RETRIES,
+        );
+
+        assert_eq!(telemetry.attempt_scope, "provider");
+        assert_eq!(
+            telemetry.max_attempts,
+            MAX_RETRYABLE_LIVE_STREAM_RETRIES + 1
+        );
+        assert_eq!(
+            telemetry.timeout_retries_used,
+            Some(MAX_RESPONSE_TIMEOUT_RETRIES)
+        );
     }
 
     #[test]
@@ -2597,6 +3094,83 @@ mod tests {
         assert!(retryable_live_start_codex_error(&err));
         err.origin = client::CodexErrorOrigin::Http;
         assert!(!retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn live_recovery_telemetry_normalizes_connection_reset_without_raw_error() {
+        let ctx = live_test_context("recovery-telemetry");
+        let error = client::CodexError {
+            status: 0,
+            message: concat!(
+                "WebSocket stream error: WebSocket protocol error: ",
+                "Connection reset without closing handshake"
+            )
+            .to_string(),
+            detail: Some(websocket::WEBSOCKET_STREAM_TRANSPORT_ERROR_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert_eq!(live_recovery_error_kind(&error), "connection_reset");
+        let fields = live_recovery_fields(
+            &ctx,
+            LiveRecoveryRoute {
+                configured_transport: config::CodexTransport::Auto,
+                actual_transport: websocket::CodexLiveTransport::WebSocket,
+            },
+            "pre_output",
+            &error,
+        );
+        assert_eq!(fields.get("reqId"), Some(&serde_json::json!(ctx.req_id)));
+        assert_eq!(
+            fields.get("configuredTransport"),
+            Some(&serde_json::json!("auto"))
+        );
+        assert_eq!(
+            fields.get("actualTransport"),
+            Some(&serde_json::json!("websocket"))
+        );
+        assert_eq!(
+            fields.get("errorOrigin"),
+            Some(&serde_json::json!("websocket"))
+        );
+        assert_eq!(
+            fields.get("recoveryPhase"),
+            Some(&serde_json::json!("pre_output"))
+        );
+        assert_eq!(
+            fields.get("errorKind"),
+            Some(&serde_json::json!("connection_reset"))
+        );
+        assert!(!fields.contains_key("error"));
+        assert!(!fields.contains_key("message"));
+    }
+
+    #[test]
+    fn live_recovery_telemetry_classifies_structured_timeout_and_eof() {
+        let mut error = client::CodexError {
+            status: 0,
+            message: "structured failure".to_string(),
+            detail: Some(websocket::WEBSOCKET_RESPONSE_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+        assert_eq!(live_recovery_error_kind(&error), "timeout");
+
+        error.detail = Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string());
+        assert_eq!(live_recovery_error_kind(&error), "premature_eof");
+
+        error.message = "WebSocket keepalive send timed out after 10000ms".to_string();
+        error.detail = Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string());
+        assert_eq!(live_recovery_error_kind(&error), "keepalive_failure");
+
+        error.origin = client::CodexErrorOrigin::Http;
+        error.message = "Codex SSE frame contains invalid JSON".to_string();
+        error.detail = Some("http_response_sse".to_string());
+        assert_eq!(live_recovery_error_kind(&error), "protocol_error");
+
+        error.message = "Codex SSE stream ended with an incomplete frame".to_string();
+        assert_eq!(live_recovery_error_kind(&error), "premature_eof");
     }
 
     #[test]
