@@ -29,6 +29,8 @@ Streaming responses use Anthropic SSE events such as `message_start`, `content_b
 
 Unknown models return HTTP 400 with the supported catalog. Missing provider auth returns HTTP 401.
 
+Responses from `/v1/messages` and `/v1/messages/count_tokens` include a `request-id` header. Claude Code records it as `requestId` in session transcripts so repeated records from the same HTTP request can be de-duplicated. The proxy preserves an existing upstream value; otherwise it uses the per-request UUID shown as `reqId` in proxy logs and the monitor.
+
 ## `POST /v1/messages/count_tokens`
 
 Accepts the same basic Anthropic request shape and returns:

@@ -50,6 +50,7 @@ use uuid::Uuid;
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+const REQUEST_ID_HEADER: &str = "request-id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -1450,7 +1451,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return stamp_request_id(response, &req_id);
         }
     };
 
@@ -1490,7 +1491,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
             );
-            return response;
+            return stamp_request_id(response, &req_id);
         }
     };
 
@@ -1545,7 +1546,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Missing model"),
             );
-            return response;
+            return stamp_request_id(response, &req_id);
         }
     };
 
@@ -1632,7 +1633,7 @@ async fn dispatch_request(
                     .map(|details| details.message.as_str())
                     .unwrap_or("Unknown model"),
             );
-            return response;
+            return stamp_request_id(response, &req_id);
         }
     };
 
@@ -1778,10 +1779,20 @@ async fn dispatch_request(
             format!("HTTP {}", status.as_u16()),
         );
     }
+    stamp_request_id(response, &req_id)
+}
+
+fn stamp_request_id(mut response: Response, req_id: &str) -> Response {
+    if !response.headers().contains_key(REQUEST_ID_HEADER)
+        && let Ok(value) = req_id.parse()
+    {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
     response
 }
 
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
+    let response = stamp_request_id(response, &guard.req_id);
     let status = response.status();
     let outcome = response.extensions().get::<ResponseOutcome>().cloned();
     let (parts, body) = response.into_parts();
@@ -2136,6 +2147,82 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod request_id_header_tests {
+    use super::{
+        AppFeatures, REQUEST_ID_HEADER, RequestMonitorGuard, app_with_features,
+        monitor_response_body,
+    };
+    use crate::registry::Registry;
+    use axum::{
+        body::Body,
+        http::{HeaderValue, Method, Request, StatusCode},
+        response::Response,
+    };
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
+    use uuid::Uuid;
+
+    fn guard(req_id: &str) -> RequestMonitorGuard {
+        RequestMonitorGuard::new(None, req_id.to_string())
+    }
+
+    #[test]
+    fn stamps_request_id_on_plain_response() {
+        let response = Response::new(Body::from("{}"));
+        let response = monitor_response_body(response, guard("req-plain"));
+
+        assert_eq!(response.headers()[REQUEST_ID_HEADER], "req-plain");
+    }
+
+    #[test]
+    fn stamps_request_id_before_streaming_body() {
+        let response = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from("event: message_start\n\n"))
+            .unwrap();
+        let response = monitor_response_body(response, guard("req-stream"));
+
+        assert_eq!(response.headers()[REQUEST_ID_HEADER], "req-stream");
+    }
+
+    #[test]
+    fn preserves_upstream_request_id() {
+        let response = Response::builder()
+            .header(
+                REQUEST_ID_HEADER,
+                HeaderValue::from_static("upstream-request"),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = monitor_response_body(response, guard("local-request"));
+
+        assert_eq!(response.headers()[REQUEST_ID_HEADER], "upstream-request");
+    }
+
+    #[tokio::test]
+    async fn stamps_request_id_on_anthropic_error_response() {
+        let response = app_with_features(
+            Arc::new(Registry::with_default_alias()),
+            None,
+            AppFeatures::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id = response.headers()[REQUEST_ID_HEADER].to_str().unwrap();
+        assert!(Uuid::parse_str(request_id).is_ok());
+    }
 }
 
 #[cfg(test)]
