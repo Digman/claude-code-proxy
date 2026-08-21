@@ -1,5 +1,7 @@
 use super::reducer::{Reducer, ReducerEvent};
+use super::search_text::search_line;
 use crate::anthropic::sse::{SseEvent, encode_sse_event};
+use crate::config::GrokSearchBlocks;
 
 pub const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -96,6 +98,7 @@ pub struct StreamTranslator {
     model: String,
     started: bool,
     finished: bool,
+    search_blocks: GrokSearchBlocks,
 }
 
 pub struct LiveStreamTranslator {
@@ -134,11 +137,21 @@ impl LiveStreamTranslator {
 
 impl StreamTranslator {
     pub fn new(message_id: String, model: String) -> Self {
+        Self::with_search_blocks(message_id, model, crate::config::grok_search_blocks())
+    }
+
+    /// Tests choose the shape directly rather than through the environment.
+    pub fn with_search_blocks(
+        message_id: String,
+        model: String,
+        search_blocks: GrokSearchBlocks,
+    ) -> Self {
         Self {
             message_id,
             model,
             started: false,
             finished: false,
+            search_blocks,
         }
     }
 
@@ -168,7 +181,7 @@ impl StreamTranslator {
             if matches!(event, ReducerEvent::Finish { .. }) {
                 self.finished = true;
             }
-            render(&mut out, event);
+            render(&mut out, event, self.search_blocks);
         }
         Ok(out)
     }
@@ -179,9 +192,26 @@ pub fn translate_stream_bytes(
     message_id: &str,
     model: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    translate_stream_bytes_with_blocks(
+        upstream,
+        message_id,
+        model,
+        crate::config::grok_search_blocks(),
+    )
+}
+
+/// Tests choose the hosted-search block shape directly rather than through the
+/// environment.
+pub fn translate_stream_bytes_with_blocks(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    search_blocks: GrokSearchBlocks,
+) -> anyhow::Result<Vec<u8>> {
     let mut decoder = SseDecoder::default();
     let mut reducer = Reducer::default();
-    let mut translator = StreamTranslator::new(message_id.into(), model.into());
+    let mut translator =
+        StreamTranslator::with_search_blocks(message_id.into(), model.into(), search_blocks);
     let mut out = Vec::new();
     for event in decoder.push(upstream)? {
         let value = serde_json::from_str(&event.data)
@@ -204,7 +234,7 @@ fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
     out.extend(encode_sse_event(Some(event), &data.to_string()));
 }
 
-fn render(out: &mut Vec<u8>, event: ReducerEvent) {
+fn render(out: &mut Vec<u8>, event: ReducerEvent, search_blocks: GrokSearchBlocks) {
     match event {
         ReducerEvent::ThinkingStart(i) => emit(
             out,
@@ -243,6 +273,44 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
             "content_block_delta",
             serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":t}}),
         ),
+        ReducerEvent::HostedSearch {
+            index,
+            result_index,
+            id,
+            name,
+            query,
+        } if search_blocks == GrokSearchBlocks::Text => {
+            // Two text blocks, because the reducer already allocated two
+            // indices for this search and a gap in the sequence would leave a
+            // hole in the client's block array. The line goes in the first;
+            // the second stays empty and draws as nothing.
+            emit(
+                out,
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+            );
+            emit(
+                out,
+                "content_block_delta",
+                serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":search_line(&name,&query)}}),
+            );
+            emit(
+                out,
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":index}),
+            );
+            emit(
+                out,
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":result_index,"content_block":{"type":"text","text":""}}),
+            );
+            emit(
+                out,
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":result_index}),
+            );
+            let _ = id;
+        }
         ReducerEvent::HostedSearch {
             index,
             result_index,
@@ -370,26 +438,90 @@ mod tests {
     #[test]
     fn stream_translates_hosted_web_search_and_citations() {
         let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\ndata: {\"type\":\"response.web_search_call.in_progress\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.web_search_call.searching\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.web_search_call.completed\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"rust news\"}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Result\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
-        let output =
-            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+        let output = String::from_utf8(
+            translate_stream_bytes_with_blocks(
+                input,
+                "msg_1",
+                "grok-4.5",
+                GrokSearchBlocks::Native,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(output.contains("server_tool_use"));
         assert!(output.contains("web_search_tool_result"));
         assert!(output.contains("citations_delta"));
         assert!(output.contains("https://example.com"));
         assert!(output.contains("\"web_search_requests\":1"));
+
+        let text = String::from_utf8(
+            translate_stream_bytes_with_blocks(input, "msg_1", "grok-4.5", GrokSearchBlocks::Text)
+                .unwrap(),
+        )
+        .unwrap();
+        // The usage object legitimately carries a `server_tool_use` counter, so
+        // match the block type rather than the bare word.
+        assert!(!text.contains("\"type\":\"server_tool_use\""));
+        assert!(!text.contains("web_search_tool_result"));
+        assert!(text.contains("[web search: rust news]"));
+        // Citations and usage are untouched by the block shape.
+        assert!(text.contains("citations_delta"));
+        assert!(text.contains("https://example.com"));
+        assert!(text.contains("\"web_search_requests\":1"));
+    }
+
+    #[test]
+    fn text_search_blocks_keep_the_block_index_sequence_contiguous() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"rust news\"}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Result\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
+        let output = String::from_utf8(
+            translate_stream_bytes_with_blocks(input, "msg_1", "grok-4.5", GrokSearchBlocks::Text)
+                .unwrap(),
+        )
+        .unwrap();
+        // The reducer allocates two indices per search. A client that stores
+        // blocks by index would be left with a hole if only one were emitted.
+        let started: Vec<u64> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter(|event| event["type"] == "content_block_start")
+            .filter_map(|event| event["index"].as_u64())
+            .collect();
+        assert_eq!(started, vec![0, 1, 2], "block indices are not contiguous");
     }
 
     #[test]
     fn stream_translates_hosted_x_search_usage_and_citations() {
         let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"claude-code-proxy\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Recent post\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://x.com/example/status/1\",\"title\":\"Example post\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n";
-        let output =
-            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+        let output = String::from_utf8(
+            translate_stream_bytes_with_blocks(
+                input,
+                "msg_1",
+                "grok-4.5",
+                GrokSearchBlocks::Native,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(output.contains("\"name\":\"x_search\""));
         assert!(output.contains("x_search_tool_result"));
         assert!(output.contains("https://x.com/example/status/1"));
         assert!(output.contains("\"web_search_requests\":1"));
         assert!(output.contains("\"x_search_requests\":1"));
         assert!(!output.contains("\"name\":\"Bash\""));
+
+        let text = String::from_utf8(
+            translate_stream_bytes_with_blocks(input, "msg_1", "grok-4.5", GrokSearchBlocks::Text)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!text.contains("x_search_tool_result"));
+        // The usage object legitimately carries a `server_tool_use` counter, so
+        // match the block type rather than the bare word.
+        assert!(!text.contains("\"type\":\"server_tool_use\""));
+        assert!(text.contains("[X search: claude-code-proxy]"));
+        assert!(text.contains("https://x.com/example/status/1"));
+        assert!(text.contains("\"x_search_requests\":1"));
     }
 
     #[test]

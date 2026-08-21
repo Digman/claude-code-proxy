@@ -83,6 +83,8 @@ For Kimi, Grok, OpenCode Go, and Cursor, the route accepts:
 - `reasoning_effort`
 - streaming, non-streaming responses, and `stream_options.include_usage`
 
+For Grok, `reasoning_effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`. `xhigh` is available at full strength on `grok-4.6`; `xhigh` and `max` map to `high` for other registered Grok models.
+
 Codex uses its own compatibility path. It supports text messages, `reasoning_effort`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Reasoning effort defaults to `medium`, and the proxy-wide Codex effort setting takes precedence. Function calls, images, audio, log probabilities, multiple choices, storage, and output token limits are not supported on the Codex Chat Completions path.
 
 Non-streaming requests return a `chat.completion` object. Streaming requests return `chat.completion.chunk` events followed by `data: [DONE]`. Grok citations are included in message annotations.
@@ -134,6 +136,8 @@ Codex models use native Responses passthrough, including native JSON and SSE out
 - `max_output_tokens`
 - `reasoning.effort`
 - streaming or non-streaming output
+
+For Grok, `reasoning.effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`, with model-specific mapping for the highest levels.
 
 Responses include the accepted tool settings. Grok search appears as a `web_search_call`, with sources in URL citation annotations. When a provider reaches its output token limit, the response status is `incomplete` and the reason is `max_output_tokens`.
 

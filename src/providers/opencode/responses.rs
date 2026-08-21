@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::codex::translate::{
-    IncompleteResponsePolicy, accumulate::accumulate_response_with_policy_and_traffic,
+    IncompleteResponsePolicy, accumulate::accumulate_response_with_policy,
     live_stream::LiveStreamTranslator, request::translate_openai_compatible_request,
 };
 use crate::providers::grok::translate::stream::SseDecoder;
@@ -34,12 +34,11 @@ pub fn accumulate_response(
     message_id: &str,
     model: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    accumulate_response_with_policy_and_traffic(
+    accumulate_response_with_policy(
         upstream,
         message_id,
         model,
         IncompleteResponsePolicy::AllowMaxOutputTokens,
-        None,
     )
 }
 

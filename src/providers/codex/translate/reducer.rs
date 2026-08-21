@@ -1177,14 +1177,21 @@ mod tests {
     }
 
     #[test]
-    fn reduce_rate_limit_throws() {
-        let upstream = sse(
-            "codex.rate_limits",
-            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+    fn reduce_rate_limit_snapshot_is_progress_telemetry() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "codex.rate_limits",
+                json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            )
         );
-        let result = reduce_upstream_bytes(upstream.as_bytes());
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::RateLimit);
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(matches!(out.first(), Some(ReducerEvent::Progress)));
+        assert!(matches!(out.last(), Some(ReducerEvent::Finish { .. })));
     }
 
     #[test]
@@ -1428,6 +1435,61 @@ mod tests {
             assert_eq!(diagnostics.last_event_type.as_deref(), Some(event_type));
             assert!(diagnostics.saw_terminal_event);
         }
+    }
+
+    #[test]
+    fn completed_terminal_followed_by_done_marker_remains_valid() {
+        let upstream = format!(
+            "{}data: [DONE]\n\n",
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            ),
+        );
+
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_END_TURN);
+    }
+
+    #[test]
+    fn standard_responses_max_tokens_takes_priority_over_tool_use() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"output_index":0,"delta":"{}"}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}
+                }),
+            ),
+            sse(
+                "response.incomplete",
+                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
+            ),
+        );
+        let out = reduce_upstream_bytes_with_policy(
+            upstream.as_bytes(),
+            IncompleteResponsePolicy::AllowMaxOutputTokens,
+        )
+        .unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_MAX_TOKENS);
     }
 
     #[test]

@@ -3678,6 +3678,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_stream_forwards_semantic_event_before_terminal_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_http_chunk(
+                &mut stream,
+                b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+            )
+            .await;
+            release_rx.await.unwrap();
+            write_http_chunk(
+                &mut stream,
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{}}}\n\n",
+            )
+            .await;
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+
+        let synthetic = events.recv().await.unwrap().unwrap();
+        assert_eq!(
+            synthetic.get("type").and_then(|value| value.as_str()),
+            Some("keepalive")
+        );
+        let first_upstream = tokio::time::timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("first semantic event must arrive before the response completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_upstream.get("type").and_then(|value| value.as_str()),
+            Some("response.output_text.delta")
+        );
+
+        release_tx.send(()).unwrap();
+        let terminal = events.recv().await.unwrap().unwrap();
+        assert_eq!(
+            terminal.get("type").and_then(|value| value.as_str()),
+            Some("response.completed")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn websocket_stream_forwards_signature_only_reasoning_before_hosted_search_reset() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5601,11 +5660,23 @@ mod tests {
         })));
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.output_item.added",
-            "item": {"type": "function_call"}
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_1"}
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
         })));
         assert!(event_closes_live_retry_window(&serde_json::json!({
             "type": "response.output_text.delta",
+            "output_index": 0,
             "delta": "hello"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": "{}"
         })));
     }
 

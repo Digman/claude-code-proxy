@@ -38,7 +38,22 @@ pub fn accumulate_response_with_traffic(
     )
 }
 
-pub(crate) fn accumulate_response_with_policy_and_traffic(
+pub(crate) fn accumulate_response_with_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    incomplete_response_policy: IncompleteResponsePolicy,
+) -> Result<Value, anyhow::Error> {
+    accumulate_response_with_policy_and_traffic(
+        upstream,
+        message_id,
+        model,
+        incomplete_response_policy,
+        None,
+    )
+}
+
+fn accumulate_response_with_policy_and_traffic(
     upstream: &[u8],
     message_id: &str,
     model: &str,

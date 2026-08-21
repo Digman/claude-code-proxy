@@ -462,6 +462,59 @@ pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grok hosted-search policy (CCP_GROK_HOSTED_SEARCH)
+// ---------------------------------------------------------------------------
+
+/// Whether the Grok translator replaces caller search tools with xAI-hosted
+/// search and requires hosted tool use on explicit search turns.
+///
+/// The disabled policy preserves caller tools, instructions, and tool choice.
+/// It adds `x_search` only to X-specific turns because the caller has no
+/// equivalent access to xAI's X index.
+///
+/// The enabled policy favors xAI-hosted search and citations. Hosted tools
+/// replace caller search implementations, matching turns receive search
+/// guidance, and explicit search turns use `tool_choice: required`.
+///
+/// Set `CCP_GROK_HOSTED_SEARCH` to `1`, `on`, or `true` to enable this policy.
+pub fn parse_grok_hosted_search(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1" | "on" | "true"))
+}
+
+pub fn grok_hosted_search() -> bool {
+    parse_grok_hosted_search(std::env::var("CCP_GROK_HOSTED_SEARCH").ok().as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Grok hosted-search block shape (CCP_GROK_SEARCH_BLOCKS)
+// ---------------------------------------------------------------------------
+
+/// How a hosted search that xAI ran is reported to the client.
+///
+/// `Text` projects the search query into a standard `text` block.
+///
+/// `Native` preserves the Anthropic server-tool shape: `server_tool_use`
+/// followed by `web_search_tool_result` or `x_search_tool_result`. Select this
+/// shape for clients that consume hosted-tool blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokSearchBlocks {
+    Text,
+    Native,
+}
+
+pub fn parse_grok_search_blocks(raw: Option<&str>) -> GrokSearchBlocks {
+    match raw.map(str::trim) {
+        Some("native") => GrokSearchBlocks::Native,
+        // Text is the compatibility-safe fallback for empty or unknown values.
+        _ => GrokSearchBlocks::Text,
+    }
+}
+
+pub fn grok_search_blocks() -> GrokSearchBlocks {
+    parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
+}
+
 struct ResolvedOpenCodeConfig {
     api_key: Option<String>,
     api_key_source: Option<&'static str>,

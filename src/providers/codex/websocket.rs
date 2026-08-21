@@ -3250,11 +3250,20 @@ mod tests {
         let completed = serde_json::json!({"type": "response.completed"});
         assert!(is_terminal_event(&completed));
 
+        let done = serde_json::json!({"type": "response.done"});
+        assert!(is_terminal_event(&done));
+
         let delta = serde_json::json!({"type": "response.output_text.delta"});
         assert!(!is_terminal_event(&delta));
 
         let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
         assert!(is_terminal_event(&error));
+
+        let response_error = serde_json::json!({
+            "type": "response.error",
+            "response": {"error": {"message": "fail"}}
+        });
+        assert!(is_terminal_event(&response_error));
     }
 
     #[test]
